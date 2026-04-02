@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
 ENGINE = ReplacingMergeTree
 ORDER BY (data.sessionId::String, data.timestamp::String, data.uuid::String);
 
-CREATE TABLE TABLE IF NOT EXISTS claude_code.classification
+CREATE TABLE IF NOT EXISTS claude_code.classification
 (
     data JSON
 )
