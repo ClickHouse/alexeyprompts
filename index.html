@@ -508,6 +508,33 @@ mark.search-hit.current { background: #f88; color: #000; }
 .term-md strong { color: #fff; }
 .term-md img { max-width: 100%; }
 
+/* Slash / local command rendering inside the transcript */
+.cmd-line {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    padding: 2px 0;
+}
+.cmd-name {
+    color: #c4b5fd;
+    background: rgba(124, 58, 237, 0.18);
+    border: 1px solid rgba(124, 58, 237, 0.4);
+    border-radius: 3px;
+    padding: 0 6px;
+    font-weight: bold;
+}
+.cmd-args { color: var(--text); word-break: break-all; }
+.cmd-output {
+    margin-top: 4px;
+    color: #888;
+    border-left: 2px solid #333;
+    padding-left: 8px;
+    font-size: 12px;
+}
+.cmd-caveat { color: #555; font-style: italic; font-size: 11px; margin-top: 4px; }
+
 .hidden { display: none !important; }
 
 .loading {
@@ -1098,22 +1125,10 @@ function sortByRelevance(list) {
     });
 }
 
-function classificationRank(s) {
-    if (s.agent_right) return 0;
-    if (s.user_corrected) return 1;
-    if (s.remarkable) return 2;
-    return 3;
-}
-
 function sortSessions(list) {
     const dir = sortDir === 'asc' ? 1 : -1;
     const col = sortCol;
-    const useDefaultSort = col === 'started' && sortDir === 'desc';
     return [...list].sort((a, b) => {
-        if (useDefaultSort) {
-            const ca = classificationRank(a), cb = classificationRank(b);
-            if (ca !== cb) return ca - cb;
-        }
         let va, vb;
         if (col === 'summary') {
             va = getSummaryText(a).toLowerCase();
@@ -1402,6 +1417,44 @@ function parseContentBlocks(contentStr) {
     return [{ type: 'text', text: contentStr }];
 }
 
+// Slash-command and local-command wrappers, e.g.
+//   <command-message>continue-pr</command-message>
+//   <command-name>/continue-pr</command-name>
+//   <command-args>https://...</command-args>
+// Returns rendered HTML, or null if the text has no command tags.
+const COMMAND_TAG_RE = /<\/?(command-(?:message|name|args|contents)|local-command-(?:stdout|stderr|caveat))>/;
+function extractTag(text, tag) {
+    const m = text.match(new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>'));
+    return m ? m[1].trim() : null;
+}
+function renderCommandMessage(text) {
+    if (!COMMAND_TAG_RE.test(text)) return null;
+    const name = extractTag(text, 'command-name');
+    const args = extractTag(text, 'command-args');
+    const message = extractTag(text, 'command-message');
+    const contents = extractTag(text, 'command-contents');
+    const stdout = extractTag(text, 'local-command-stdout');
+    const stderr = extractTag(text, 'local-command-stderr');
+    const caveat = extractTag(text, 'local-command-caveat');
+
+    const parts = [];
+    // Slash command invocation: "/continue-pr  https://..."
+    const cmdName = name || (message ? '/' + message : null);
+    if (cmdName) {
+        let line = `<span class="cmd-name">${escapeHtml(cmdName)}</span>`;
+        if (args) line += ` <span class="cmd-args">${escapeHtml(args)}</span>`;
+        parts.push(`<div class="cmd-line">${line}</div>`);
+    }
+    // Expanded command body (custom commands), shown collapsed/dim.
+    if (contents) parts.push(`<div class="cmd-output" style="white-space:pre-wrap">${renderAnsi(contents)}</div>`);
+    // Output of a local "!" command.
+    const out = [stdout, stderr].filter(s => s != null && s !== '').join('\n');
+    if (out) parts.push(`<div class="cmd-output" style="white-space:pre-wrap">${renderAnsi(out)}</div>`);
+    if (caveat) parts.push(`<div class="cmd-caveat">${escapeHtml(caveat)}</div>`);
+
+    return parts.length ? parts.join('') : null;
+}
+
 function renderToolInput(input) {
     if (!input || typeof input !== 'object') return renderAnsi(String(input || ''));
     const lines = [];
@@ -1674,7 +1727,8 @@ function renderTranscript() {
         let bodyHtml = '';
         for (const block of blocks) {
             if (block.type === 'text' && block.text) {
-                bodyHtml += renderMd(block.text);
+                const cmd = renderCommandMessage(block.text);
+                bodyHtml += cmd != null ? cmd : renderMd(block.text);
             } else if (block.type === 'tool_result') {
                 if (!filters.results) continue;
                 bodyHtml += renderToolResult(block);
