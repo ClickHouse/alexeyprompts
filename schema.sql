@@ -62,7 +62,14 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
 
     -- Lowercased, concatenated searchable text + an ngram text index, so
     -- substring search (search_text LIKE '%term%') prunes granules instead of
-    -- scanning every row's content.
+    -- scanning every row's content. To benefit at query time:
+    --   * set allow_experimental_full_text_index=1 (required for pruning),
+    --   * match the lowercased term, and
+    --   * reference search_text only in WHERE, never in SELECT (else the whole
+    --     column is read and the index is bypassed).
+    -- Tradeoffs: search_text roughly triples on-disk size and makes merges
+    -- heavier (each merge rebuilds the index); ngram pruning is strong only for
+    -- terms with rare character sequences.
     search_text String MATERIALIZED lower(toString(data.message.content) || ' ' || data.toolUseResult.content::String || ' ' || data.toolUseResult.stdout::String || ' ' || data.toolUseResult.stderr::String || ' ' || data.summary::String),
     INDEX idx_search search_text TYPE text(tokenizer = 'ngrams') GRANULARITY 1
 )
