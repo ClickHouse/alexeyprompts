@@ -8,18 +8,12 @@ A viewer of Claude Code sessions with ClickHouse backend.
 
 ### How to use
 
-Create a ClickHouse database:
+Create the database and tables. The `raw` table uses JSON type hints plus a few
+materialized columns and a text index so the UI's queries stay fast (see
+`schema.sql` for the full definition and the reasoning):
 
 ```
-CREATE DATABASE IF NOT EXISTS claude_code;
-
-CREATE TABLE IF NOT EXISTS claude_code.raw
-(
-    path String,
-    data JSON
-)
-ENGINE = ReplacingMergeTree
-ORDER BY (data.sessionId::String, data.timestamp::String, data.uuid::String);
+clickhouse-client < schema.sql
 
 CREATE TABLE IF NOT EXISTS claude_code.classification
 (

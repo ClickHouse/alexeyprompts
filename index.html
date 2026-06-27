@@ -991,7 +991,7 @@ async function loadLineStats() {
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
-    AND dynamicType(data.message.content) LIKE 'Array%'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
     AND block.name::String IN ('Edit', 'Write')
 GROUP BY session_id`;
@@ -1013,6 +1013,8 @@ async function loadSessions() {
         // Compact per-session index for ALL sessions: numbers + short strings only.
         // The full first-message blob is NOT transferred; instead we send a 300-char
         // text preview (first_question_text) and the extracted plan reference (plan_ref).
+        // Trivial fields read straight from the (hinted) JSON; content-derived
+        // values use materialized columns so this never scans data.message.content.
         const sql = `SELECT
     session_id, project, started, ended, total_duration_sec,
     user_msgs, assistant_msgs, all_msgs,
@@ -1026,17 +1028,17 @@ async function loadSessions() {
 FROM (
 SELECT
     data.sessionId::String AS session_id,
-    replaceAll(replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\\\1'), '-', '/') AS project,
-    min(parseDateTime64BestEffortOrNull(data.timestamp::String)) AS started,
-    max(parseDateTime64BestEffortOrNull(data.timestamp::String)) AS ended,
+    project,
+    min(ts) AS started,
+    max(ts) AS ended,
     dateDiff('second', started, ended) AS total_duration_sec,
     countIf(data.type::String = 'user'
-        AND dynamicType(data.message.content) = 'String'
+        AND content_kind = 'String'
         AND data.isMeta::Bool = false
-        AND NOT data.message.content::String LIKE 'Implement the following plan:%'
-        AND NOT data.message.content::String LIKE '[Request interrupted by user%'
-        AND NOT data.message.content::String LIKE '%This session is being continued from a previous conversation%'
-        AND NOT data.message.content::String LIKE '%<task-notification>%'
+        AND NOT user_text LIKE 'Implement the following plan:%'
+        AND NOT user_text LIKE '[Request interrupted by user%'
+        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
+        AND NOT user_text LIKE '%<task-notification>%'
     ) AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs,
     countIf(data.type::String = 'user') + countIf(data.type::String = 'assistant') AS all_msgs,
@@ -1048,19 +1050,11 @@ SELECT
     anyIf(data.summary::String, data.type::String = 'summary' AND data.summary::String != '') AS summary,
     anyIf(data.message.model::String, data.type::String = 'assistant' AND data.message.model::String NOT IN ('', '<synthetic>')) AS model,
     anyIf(data.gitBranch::String, data.gitBranch::String != '') AS git_branch,
-    argMinIf(
-        multiIf(
-            dynamicType(data.message.content) = 'String', data.message.content::String,
-            dynamicType(data.message.content) LIKE 'Array%', arrayStringConcat(arrayMap(x -> x.text::String, arrayFilter(x -> x.type::String = 'text', data.message.content::Array(JSON))), ' '),
-            ''
-        ),
-        parseDateTime64BestEffortOrNull(data.timestamp::String),
-        data.type::String = 'user' AND data.parentUuid::String = ''
-    ) AS fq_full,
-    countIf(data.type::String = 'assistant' AND dynamicType(data.message.content) LIKE 'Array%' AND arrayExists(x -> x.name::String = 'EnterPlanMode', data.message.content::Array(JSON))) AS plan_count,
+    argMinIf(root_text, ts, is_root_user) AS fq_full,
+    countIf(is_plan) AS plan_count,
     countIf(data.type::String = 'system' AND data.subtype::String IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
-    countIf(data.type::String = 'user' AND dynamicType(data.message.content) LIKE 'Array%' AND arrayExists(x -> x.type::String = 'tool_result' AND (x.is_error::Bool = false OR dynamicType(x.is_error) = 'None'), data.message.content::Array(JSON))) AS approved_count,
-    countIf(data.type::String = 'user' AND dynamicType(data.message.content) LIKE 'Array%' AND arrayExists(x -> x.type::String = 'tool_result' AND x.is_error::Bool = true AND x.content::String LIKE '%tool use was rejected%', data.message.content::Array(JSON))) AS rejected_count
+    countIf(is_approved) AS approved_count,
+    countIf(is_rejected) AS rejected_count
 FROM claude_code.raw
 WHERE path NOT LIKE '%history.jsonl'
 GROUP BY session_id, project
@@ -1289,27 +1283,26 @@ async function fullTextSearch(query) {
     const controller = new AbortController();
     searchAbort = controller;
     const escaped = query.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    // search_text is a lowercased materialized column backed by an ngram text
+    // index, so match against the lowercased term to let the index prune.
+    const escapedLower = query.toLowerCase().replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     try {
+        // WHERE filters on search_text (ngram text index prunes granules). The
+        // relevance rank must NOT reference search_text again -- doing so forces
+        // a full read of that large column and defeats the index. Every matched
+        // row already contains the term, so ranking by message kind is enough.
         const sql = `SELECT
     data.sessionId::String AS session_id,
     min(multiIf(
-        data.type::String = 'user' AND data.isMeta::Bool = false
-            AND dynamicType(data.message.content) = 'String'
-            AND data.message.content::String ILIKE '%${escaped}%', 1,
-        data.type::String = 'assistant'
-            AND toString(data.message.content) NOT LIKE '%"type":"thinking"%'
-            AND toString(data.message.content) ILIKE '%${escaped}%', 2,
-        data.type::String = 'assistant'
-            AND toString(data.message.content) ILIKE '%${escaped}%', 3,
-        4
+        data.type::String = 'user' AND data.isMeta::Bool = false AND content_kind = 'String'
+            AND user_text ILIKE '%${escaped}%', 1,
+        data.type::String = 'assistant', 2,
+        3
     )) AS relevance
 FROM claude_code.raw
-WHERE toString(data.message.content) ILIKE '%${escaped}%'
-   OR data.toolUseResult.content::String ILIKE '%${escaped}%'
-   OR data.toolUseResult.stdout::String ILIKE '%${escaped}%'
-   OR data.toolUseResult.stderr::String ILIKE '%${escaped}%'
-   OR data.summary::String ILIKE '%${escaped}%'
-GROUP BY session_id`;
+WHERE search_text LIKE '%${escapedLower}%'
+GROUP BY session_id
+SETTINGS allow_experimental_full_text_index = 1`;
         const resp = await fetch(chRequestUrl(), {
             method: 'POST',
             headers: CH_HEADERS,

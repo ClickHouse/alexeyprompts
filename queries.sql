@@ -1,12 +1,14 @@
 -- Analytical queries for Claude Code session data
--- All operate on claude_code.raw (path String, data JSON)
+-- All operate on claude_code.raw (see schema.sql).
 --
--- The path column contains the original file path.
--- The data column contains the raw JSON from each JSONL line.
+-- Plain scalar fields are read as data.field::Type -- they are JSON type hints,
+-- so this reads native typed subcolumns, not the dynamic JSON. Computed values
+-- (project, ts, content_kind, is_root_user/root_text, is_plan/is_approved/
+-- is_rejected, search_text) come from materialized columns so queries avoid
+-- scanning the multi-GB data.message.content.
 --
--- Accessing JSON fields: data.field::Type (e.g. data.type::String)
--- Content blocks are Array(JSON): data.message.content::Array(JSON)
--- Use ARRAY JOIN to unnest content blocks.
+-- Content blocks are still Array(JSON): unnest with ARRAY JOIN over
+-- data.message.content::Array(JSON) (guarded by content_kind LIKE 'Array%').
 
 -- 1. Overview
 SELECT
@@ -15,16 +17,16 @@ SELECT
     countIf(data.type::String = 'assistant') AS assistant_messages,
     countIf(data.type::String = 'progress') AS progress_updates,
     uniqExact(data.sessionId::String) AS sessions,
-    uniqExact(replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1')) AS projects
+    uniqExact(project) AS projects
 FROM claude_code.raw;
 
 -- 2. Daily activity
 SELECT
-    toDate(data.timestamp::DateTime64(3)) AS day,
+    toDate(ts) AS day,
     countIf(data.type::String = 'user') AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs,
     uniqExact(data.sessionId::String) AS sessions,
-    sum(data.message.usage.output_tokens::UInt32) AS output_tokens
+    sum(data.message.usage.output_tokens::UInt64) AS output_tokens
 FROM claude_code.raw
 WHERE data.type::String IN ('user', 'assistant')
 GROUP BY day
@@ -32,11 +34,11 @@ ORDER BY day;
 
 -- 3. Project activity
 SELECT
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
+    project,
     countIf(data.type::String = 'user') AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs,
     uniqExact(data.sessionId::String) AS sessions,
-    sum(data.message.usage.output_tokens::UInt32) AS output_tokens
+    sum(data.message.usage.output_tokens::UInt64) AS output_tokens
 FROM claude_code.raw
 WHERE data.type::String IN ('user', 'assistant')
 GROUP BY project
@@ -65,13 +67,14 @@ SELECT
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
 GROUP BY tool_name
 ORDER BY calls DESC;
 
 -- 6. Hourly distribution
 SELECT
-    toHour(data.timestamp::DateTime64(3)) AS hour,
+    toHour(ts) AS hour,
     countIf(data.type::String = 'user') AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs
 FROM claude_code.raw
@@ -83,10 +86,10 @@ ORDER BY hour;
 SELECT
     data.message.model::String AS model,
     count() AS turns,
-    avg(data.message.usage.output_tokens::UInt32) AS avg_output,
-    avg(data.message.usage.input_tokens::UInt32) AS avg_input,
-    max(data.message.usage.output_tokens::UInt32) AS max_output,
-    avg(data.message.usage.cache_read_input_tokens::UInt32) AS avg_cache_read
+    avg(data.message.usage.output_tokens::UInt64) AS avg_output,
+    avg(data.message.usage.input_tokens::UInt64) AS avg_input,
+    max(data.message.usage.output_tokens::UInt64) AS max_output,
+    avg(data.message.usage.cache_read_input_tokens::UInt64) AS avg_cache_read
 FROM claude_code.raw
 WHERE data.type::String = 'assistant'
     AND data.message.model::String NOT IN ('', '<synthetic>')
@@ -95,13 +98,13 @@ GROUP BY model;
 -- 8. Longest sessions
 SELECT
     data.sessionId::String AS session_id,
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
-    min(data.timestamp::DateTime64(3)) AS started,
-    max(data.timestamp::DateTime64(3)) AS ended,
+    project,
+    min(ts) AS started,
+    max(ts) AS ended,
     dateDiff('second', started, ended) AS duration_sec,
     countIf(data.type::String = 'user') AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs,
-    sum(data.message.usage.output_tokens::UInt32) AS output_tokens
+    sum(data.message.usage.output_tokens::UInt64) AS output_tokens
 FROM claude_code.raw
 WHERE data.type::String IN ('user', 'assistant')
 GROUP BY session_id, project
@@ -111,10 +114,10 @@ LIMIT 20;
 -- 9. Most active sessions by output tokens
 SELECT
     data.sessionId::String AS session_id,
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
+    project,
     countIf(data.type::String = 'user') AS user_msgs,
     countIf(data.type::String = 'assistant') AS assistant_msgs,
-    sum(data.message.usage.output_tokens::UInt32) AS output_tokens
+    sum(data.message.usage.output_tokens::UInt64) AS output_tokens
 FROM claude_code.raw
 WHERE data.type::String IN ('user', 'assistant')
 GROUP BY session_id, project
@@ -124,21 +127,20 @@ LIMIT 20;
 -- 10. First question of each session (most recent)
 SELECT
     data.sessionId::String AS session_id,
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
-    data.timestamp::DateTime64(3) AS ts,
-    left(data.message.content::String, 150) AS question
+    project,
+    ts,
+    left(root_text, 150) AS question
 FROM claude_code.raw
-WHERE data.type::String = 'user'
-    AND data.parentUuid::String = ''
-    AND data.message.content::String != ''
+WHERE is_root_user
+    AND root_text != ''
 ORDER BY ts DESC
 LIMIT 30;
 
 -- 11. Turn durations — slowest turns
 SELECT
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
+    project,
     data.sessionId::String AS session_id,
-    data.timestamp::DateTime64(3) AS ts,
+    ts,
     data.durationMs::UInt32 / 1000.0 AS duration_sec
 FROM claude_code.raw
 WHERE data.type::String = 'system' AND data.subtype::String = 'turn_duration'
@@ -147,7 +149,7 @@ LIMIT 20;
 
 -- 12. Average turn duration by project
 SELECT
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
+    project,
     avg(data.durationMs::UInt32) / 1000 AS avg_sec,
     max(data.durationMs::UInt32) / 1000 AS max_sec,
     count() AS turns
@@ -158,7 +160,7 @@ ORDER BY avg_sec DESC;
 
 -- 13. Weekly token consumption
 SELECT
-    toMonday(data.timestamp::DateTime64(3)) AS week,
+    toMonday(ts) AS week,
     sum(data.message.usage.input_tokens::UInt64) AS input_tokens,
     sum(data.message.usage.output_tokens::UInt64) AS output_tokens,
     sum(data.message.usage.cache_read_input_tokens::UInt64) AS cache_read,
@@ -173,7 +175,7 @@ SELECT
     data.prRepository::String AS repo,
     data.prNumber::UInt32 AS pr,
     data.prUrl::String AS url,
-    data.timestamp::DateTime64(3) AS ts
+    ts
 FROM claude_code.raw
 WHERE data.type::String = 'pr-link'
 ORDER BY ts DESC;
@@ -181,7 +183,7 @@ ORDER BY ts DESC;
 -- 15. Session summaries
 SELECT
     data.summary::String AS summary,
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project
+    project
 FROM claude_code.raw
 WHERE data.type::String = 'summary' AND data.summary::String != ''
 ORDER BY path;
@@ -189,7 +191,7 @@ ORDER BY path;
 -- 16. Git branches worked on
 SELECT
     data.gitBranch::String AS branch,
-    replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\1') AS project,
+    project,
     countIf(data.type::String = 'user') AS user_msgs,
     uniqExact(data.sessionId::String) AS sessions
 FROM claude_code.raw
@@ -201,8 +203,8 @@ LIMIT 30;
 -- 17. Claude Code versions over time
 SELECT
     data.version::String AS version,
-    min(data.timestamp::DateTime64(3)) AS first_seen,
-    max(data.timestamp::DateTime64(3)) AS last_seen,
+    min(ts) AS first_seen,
+    max(ts) AS last_seen,
     uniqExact(data.sessionId::String) AS sessions
 FROM claude_code.raw
 WHERE data.version::String != '' AND data.type::String = 'user'
@@ -211,7 +213,7 @@ ORDER BY first_seen;
 
 -- 18. Cache hit ratio by day
 SELECT
-    toDate(data.timestamp::DateTime64(3)) AS day,
+    toDate(ts) AS day,
     sum(data.message.usage.cache_read_input_tokens::UInt64) AS cache_read,
     sum(data.message.usage.cache_creation_input_tokens::UInt64) AS cache_created,
     if(cache_read + cache_created > 0,
@@ -229,6 +231,7 @@ SELECT
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
     AND block.name::String = 'Bash'
 GROUP BY cmd, descr
@@ -243,6 +246,7 @@ SELECT
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
     AND block.name::String IN ('Read', 'Edit', 'Write')
 GROUP BY file, tool
@@ -257,6 +261,7 @@ SELECT
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
     AND block.name::String = 'Grep'
 GROUP BY pattern
@@ -271,6 +276,7 @@ SELECT
 FROM claude_code.raw
 ARRAY JOIN data.message.content::Array(JSON) AS block
 WHERE data.type::String = 'assistant'
+    AND content_kind LIKE 'Array%'
     AND block.type::String = 'tool_use'
     AND block.name::String = 'Task'
 GROUP BY subagent, prompt_preview
@@ -278,6 +284,7 @@ ORDER BY times DESC
 LIMIT 30;
 
 -- 23. History entries (prompts pasted to sessions)
+-- history.jsonl rows store a numeric (ms) timestamp and their own project field.
 SELECT
     toDateTime(data.timestamp::UInt64 / 1000) AS ts,
     data.project::String AS project,
@@ -286,3 +293,24 @@ FROM claude_code.raw
 WHERE path LIKE '%history.jsonl'
 ORDER BY ts DESC
 LIMIT 20;
+
+-- 24. Full-text search across sessions (uses the ngram text index on search_text)
+-- Notes:
+--   * search_text is lowercased; lowercase the term so the index can prune.
+--   * allow_experimental_full_text_index=1 is REQUIRED for the index to prune at
+--     query time -- without it the query falls back to a full column scan.
+--   * Do NOT reference search_text in SELECT (only WHERE), or the large column is
+--     read in full and the index benefit is lost.
+--   * ngram pruning is strong for terms with rare character sequences; terms
+--     whose trigrams are individually common (and very frequent terms) prune
+--     little and still scan a lot.
+SELECT
+    data.sessionId::String AS session_id,
+    any(project) AS project,
+    count() AS hits
+FROM claude_code.raw
+WHERE search_text LIKE '%clickhouse%'
+GROUP BY session_id
+ORDER BY hits DESC
+LIMIT 30
+SETTINGS allow_experimental_full_text_index = 1;
