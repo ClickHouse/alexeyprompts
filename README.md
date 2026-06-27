@@ -66,17 +66,34 @@ appended to existing sessions**:
 CH_HOST='...' CH_USER='...' CH_PASSWORD='...' ./upload_incremental.sh
 ```
 
-It keeps a marker file (`~/.claude/.ch_last_upload`) and on each run only reads
-the `.jsonl` files modified since the previous successful run, then uploads
-their rows. Untouched sessions are skipped; any overlap from a session that got
-new entries is deduplicated by the table's `ORDER BY (sessionId, timestamp,
-uuid)`. It's idempotent, so it's a good fit for cron, e.g. hourly:
+On each run it uploads the union of two sets:
+
+1. **Sessions ClickHouse doesn't have yet** — it asks the `raw` table which
+   `path`s are already loaded and uploads any local `.jsonl` that's missing.
+   This does *not* rely on file mtimes, so it works when you **collect from
+   several machines, at different times**: copy the `.jsonl` files over (rsync,
+   scp, …) and upload later. (Plain mtime checks miss these, because copying
+   preserves the original, older mtime.)
+2. **Sessions that grew** — files modified since the previous successful run *on
+   this machine* (tracked by the marker file `~/.claude/.ch_last_upload`) are
+   re-uploaded so appended entries get in.
+
+Any overlap is deduplicated by the table's `ORDER BY (sessionId, timestamp,
+uuid)`, so nothing is duplicated. It's idempotent, so it's a good fit for cron,
+e.g. hourly:
 
 ```
 0 * * * * CH_HOST='...' CH_PASSWORD='...' /path/to/upload_incremental.sh >> ~/.claude/ch_upload.log 2>&1
 ```
 
-To force a full re-upload, delete the marker: `rm ~/.claude/.ch_last_upload`.
+Options (environment variables):
+
+- `CH_SECURE=1` / `CH_SECURE=0` — force TLS on/off (defaults to on for any
+  non-`localhost` host, which ClickHouse Cloud requires).
+- `PROJECTS=/path/to/projects` — where the `.jsonl` files live (default
+  `~/.claude/projects`); point this at a directory you sync other machines into.
+- `FORCE=1` — re-upload every local file, ignoring both the marker and what's
+  already in ClickHouse.
 
 Edit `index.html` around CH_URL, CH_USER, CH_PASSWORD with your database credentials.
 
