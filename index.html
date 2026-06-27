@@ -672,6 +672,7 @@ async function queryClickHouse(sql) {
 }
 
 // --- State ---
+const DISPLAY_LIMIT = 1000; // max rows rendered to the DOM (totals are still computed over all)
 let sessions = [];
 let sortCol = 'started';
 let sortDir = 'desc';
@@ -748,37 +749,18 @@ function shortModel(m) {
 
 function getSummaryText(row) {
     if (row.summary) return row.summary;
-    if (row.first_question) {
-        const t = row.first_question;
-        // Try to parse if it's JSON array (content blocks)
-        if (t.startsWith('[')) {
-            try {
-                const blocks = JSON.parse(t);
-                if (Array.isArray(blocks)) {
-                    const texts = blocks.filter(b => b.type === 'text').map(b => b.text);
-                    if (texts.length) return texts.join(' ').slice(0, 300);
-                }
-            } catch(e) {}
-        }
-        return t.slice(0, 300);
-    }
+    if (row.first_question_text) return row.first_question_text;
     return '(no summary)';
 }
 
 // --- Plan+Implementation merging ---
-const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl/;
-const PLAN_PREFIX = 'Implement the following plan:';
-
 function mergePlanSessions() {
     const byId = new Map(sessions.map(s => [s.session_id, s]));
     const planIds = new Set(); // plan sessions to hide
 
     for (const s of sessions) {
-        const raw = s.first_question || '';
-        if (!raw.startsWith(PLAN_PREFIX)) continue;
-        const match = raw.match(UUID_RE);
-        if (!match) continue;
-        const planId = match[1];
+        const planId = s.plan_ref;
+        if (!planId) continue;
         const plan = byId.get(planId);
         if (!plan) continue;
 
@@ -805,7 +787,7 @@ function mergePlanSessions() {
         }
 
         // Use plan session's first_question as summary (the original user intent)
-        s.first_question = plan.first_question || s.first_question;
+        s.first_question_text = plan.first_question_text || s.first_question_text;
         if (plan.summary) s.summary = plan.summary;
 
         // Keep track of merged session IDs for transcript linking
@@ -858,7 +840,21 @@ async function loadSessions() {
     loading.classList.remove('hidden');
     errEl.classList.add('hidden');
     try {
+        // Compact per-session index for ALL sessions: numbers + short strings only.
+        // The full first-message blob is NOT transferred; instead we send a 300-char
+        // text preview (first_question_text) and the extracted plan reference (plan_ref).
         const sql = `SELECT
+    session_id, project, started, ended, total_duration_sec,
+    user_msgs, assistant_msgs, all_msgs,
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+    api_duration_ms, summary, model, git_branch,
+    plan_count, compaction_count, approved_count, rejected_count,
+    substring(fq_full, 1, 300) AS first_question_text,
+    if(fq_full LIKE 'Implement the following plan:%',
+        extract(fq_full, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[.]jsonl'),
+        '') AS plan_ref
+FROM (
+SELECT
     data.sessionId::String AS session_id,
     replaceAll(replaceRegexpOne(path, '.*/projects/([^/]+)/.*', '\\\\1'), '-', '/') AS project,
     min(parseDateTime64BestEffortOrNull(data.timestamp::String)) AS started,
@@ -885,12 +881,12 @@ async function loadSessions() {
     argMinIf(
         multiIf(
             dynamicType(data.message.content) = 'String', data.message.content::String,
-            dynamicType(data.message.content) LIKE 'Array%', toJSONString(data.message.content::Array(JSON)),
+            dynamicType(data.message.content) LIKE 'Array%', arrayStringConcat(arrayMap(x -> x.text::String, arrayFilter(x -> x.type::String = 'text', data.message.content::Array(JSON))), ' '),
             ''
         ),
         parseDateTime64BestEffortOrNull(data.timestamp::String),
         data.type::String = 'user' AND data.parentUuid::String = ''
-    ) AS first_question,
+    ) AS fq_full,
     countIf(data.type::String = 'assistant' AND dynamicType(data.message.content) LIKE 'Array%' AND arrayExists(x -> x.name::String = 'EnterPlanMode', data.message.content::Array(JSON))) AS plan_count,
     countIf(data.type::String = 'system' AND data.subtype::String IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
     countIf(data.type::String = 'user' AND dynamicType(data.message.content) LIKE 'Array%' AND arrayExists(x -> x.type::String = 'tool_result' AND (x.is_error::Bool = false OR dynamicType(x.is_error) = 'None'), data.message.content::Array(JSON))) AS approved_count,
@@ -899,6 +895,7 @@ FROM claude_code.raw
 WHERE path NOT LIKE '%history.jsonl'
 GROUP BY session_id, project
 HAVING user_msgs > 0
+)
 ORDER BY started DESC`;
         const [sessionRows, lineRows, classRows] = await Promise.all([
             queryClickHouse(sql),
@@ -928,7 +925,6 @@ ORDER BY started DESC`;
         mergePlanSessions();
         loading.classList.add('hidden');
         renderSessionList();
-        updateStats();
     } catch (e) {
         loading.classList.add('hidden');
         errEl.textContent = e.message;
@@ -936,13 +932,18 @@ ORDER BY started DESC`;
     }
 }
 
-function updateStats() {
+// Totals are always computed over the full filtered set (not just the rendered slice),
+// so the numbers stay correct even though at most DISPLAY_LIMIT rows are shown.
+function updateStats(filtered, shown) {
     const bar = document.getElementById('stats-bar');
-    const total = sessions.length;
-    const totalCost = sessions.reduce((s, r) => s + r.cost, 0);
-    const totalTokens = sessions.reduce((s, r) => s + (r.total_tokens || 0), 0);
+    const total = filtered.length;
+    const totalCost = filtered.reduce((s, r) => s + r.cost, 0);
+    const totalTokens = filtered.reduce((s, r) => s + (r.total_tokens || 0), 0);
+    const sessionsLabel = shown < total
+        ? `<span class="value">${shown}</span> of <span class="value">${total}</span> sessions shown`
+        : `<span class="value">${total}</span> sessions`;
     bar.innerHTML = `
-        <span><span class="value">${total}</span> sessions</span>
+        <span>${sessionsLabel}</span>
         <span><span class="value">${formatNumber(totalTokens)}</span> tokens</span>
         <span><span class="value">${formatCost(totalCost)}</span> total cost</span>
     `;
@@ -1011,6 +1012,10 @@ function renderSessionList() {
         }
     });
 
+    // Totals reflect the full filtered set; only the top DISPLAY_LIMIT rows are rendered.
+    const display = filtered.slice(0, DISPLAY_LIMIT);
+    updateStats(filtered, display.length);
+
     if (filtered.length === 0) {
         tbody.innerHTML = `<tr><td colspan="15" class="empty-state">No sessions found</td></tr>`;
         return;
@@ -1032,7 +1037,7 @@ function renderSessionList() {
     };
     const maxVals = {};
     for (const [k, fn] of Object.entries(barCols)) {
-        maxVals[k] = Math.max(...filtered.map(fn), 1);
+        maxVals[k] = display.reduce((m, s) => Math.max(m, fn(s)), 1);
     }
     function bar(col, val) {
         if (!val) return '';
@@ -1041,7 +1046,7 @@ function renderSessionList() {
         return `background:linear-gradient(to right, rgba(124,156,255,0.12) ${pct}%, transparent ${pct}%)`;
     }
 
-    tbody.innerHTML = filtered.map(s => {
+    tbody.innerHTML = display.map(s => {
         const inTok = Number(s.input_tokens) || 0;
         const outTok = Number(s.output_tokens) || 0;
         const cacheRead = Number(s.cache_read_tokens) || 0;
