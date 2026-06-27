@@ -297,8 +297,9 @@ LIMIT 20;
 -- 24. Full-text search across sessions (uses the ngram text index on search_text)
 -- Notes:
 --   * search_text is lowercased; lowercase the term so the index can prune.
---   * allow_experimental_full_text_index=1 is REQUIRED for the index to prune at
---     query time -- without it the query falls back to a full column scan.
+--   * The index is applied automatically (enable_full_text_index, a production
+--     setting that is on by default). On older versions it was the experimental
+--     allow_experimental_full_text_index and had to be set explicitly.
 --   * Do NOT reference search_text in SELECT (only WHERE), or the large column is
 --     read in full and the index benefit is lost.
 --   * ngram pruning is strong for terms with rare character sequences; terms
@@ -312,5 +313,4 @@ FROM claude_code.raw
 WHERE search_text LIKE '%clickhouse%'
 GROUP BY session_id
 ORDER BY hits DESC
-LIMIT 30
-SETTINGS allow_experimental_full_text_index = 1;
+LIMIT 30;

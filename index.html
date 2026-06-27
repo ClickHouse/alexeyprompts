@@ -1287,10 +1287,12 @@ async function fullTextSearch(query) {
     // index, so match against the lowercased term to let the index prune.
     const escapedLower = query.toLowerCase().replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     try {
-        // WHERE filters on search_text (ngram text index prunes granules). The
-        // relevance rank must NOT reference search_text again -- doing so forces
-        // a full read of that large column and defeats the index. Every matched
-        // row already contains the term, so ranking by message kind is enough.
+        // WHERE filters on search_text (ngram text index prunes granules; the
+        // index is applied by default via the production enable_full_text_index
+        // setting). The relevance rank must NOT reference search_text again --
+        // doing so forces a full read of that large column and defeats the
+        // index. Every matched row already contains the term, so ranking by
+        // message kind is enough.
         const sql = `SELECT
     data.sessionId::String AS session_id,
     min(multiIf(
@@ -1301,8 +1303,7 @@ async function fullTextSearch(query) {
     )) AS relevance
 FROM claude_code.raw
 WHERE search_text LIKE '%${escapedLower}%'
-GROUP BY session_id
-SETTINGS allow_experimental_full_text_index = 1`;
+GROUP BY session_id`;
         const resp = await fetch(chRequestUrl(), {
             method: 'POST',
             headers: CH_HEADERS,

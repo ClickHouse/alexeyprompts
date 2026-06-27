@@ -12,15 +12,16 @@
 --      avoid scanning the multi-GB content on every request.
 -- Both are computed on INSERT; you still only insert (path, data).
 --
--- Step 1: Create table (the text index needs an experimental flag at CREATE):
+-- Step 1: Create the table:
 --   clickhouse-client < schema.sql
+--   (Needs a recent ClickHouse: the text index is a production feature, governed
+--    by the enable_full_text_index setting which is on by default. On older
+--    versions it was allow_experimental_full_text_index and had to be set first.)
 --
 -- Step 2: Load data (see upload_incremental.sh for repeated/incremental loads):
 --   clickhouse-local -q "SELECT _path AS path, json AS data FROM file('$HOME/.claude/projects/*/*.jsonl', 'JSONAsString') WHERE isValidJSON(json) SETTINGS input_format_allow_errors_ratio=0.1 FORMAT Native" | clickhouse-client -q "INSERT INTO claude_code.raw FORMAT Native"
 
 CREATE DATABASE IF NOT EXISTS claude_code;
-
-SET allow_experimental_full_text_index = 1;
 
 CREATE TABLE IF NOT EXISTS claude_code.raw
 (
@@ -63,7 +64,7 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
     -- Lowercased, concatenated searchable text + an ngram text index, so
     -- substring search (search_text LIKE '%term%') prunes granules instead of
     -- scanning every row's content. To benefit at query time:
-    --   * set allow_experimental_full_text_index=1 (required for pruning),
+    --   * keep enable_full_text_index on (production, on by default),
     --   * match the lowercased term, and
     --   * reference search_text only in WHERE, never in SELECT (else the whole
     --     column is read and the index is bypassed).
