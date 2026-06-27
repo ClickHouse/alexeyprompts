@@ -902,9 +902,24 @@ function shortModel(m) {
     return m.replace('claude-', '');
 }
 
+// Plain-text version of a slash/local-command message, e.g. "/continue-pr https://...".
+// Returns null when the text has no command tags.
+function commandSummaryText(text) {
+    if (!COMMAND_TAG_RE.test(text)) return null;
+    const name = extractTag(text, 'command-name');
+    const args = extractTag(text, 'command-args');
+    const message = extractTag(text, 'command-message');
+    const cmdName = name || (message ? '/' + message : null);
+    if (cmdName) return cmdName + (args ? ' ' + args : '');
+    // No recognizable command name — just strip the tags.
+    return text.replace(/<\/?[a-z][a-z-]*>/gi, ' ').replace(/\s+/g, ' ').trim() || null;
+}
+
 function getSummaryText(row) {
     if (row.summary) return row.summary;
-    if (row.first_question_text) return row.first_question_text;
+    if (row.first_question_text) {
+        return commandSummaryText(row.first_question_text) || row.first_question_text;
+    }
     return '(no summary)';
 }
 
