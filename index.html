@@ -535,9 +535,81 @@ mark.search-hit.current { background: #f88; color: #000; }
     padding: 60px 20px;
     color: var(--text-dim);
 }
+
+/* Login overlay */
+.login-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(0, 16, 24, 0.96);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.login-form {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: 24px;
+    width: 380px;
+    max-width: 90vw;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.login-form h2 { font-size: 16px; font-weight: 600; color: var(--text-bright); }
+.login-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-dim);
+}
+.login-form input {
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+}
+.login-form input:focus { border-color: var(--accent); }
+.login-form button {
+    margin-top: 4px;
+    padding: 8px;
+    background: var(--accent-dim);
+    border: none;
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
+}
+.login-form button:hover { background: var(--accent); }
+.login-error {
+    background: rgba(220, 53, 69, 0.15);
+    border: 1px solid rgba(220, 53, 69, 0.4);
+    color: var(--red);
+    padding: 8px 10px;
+    font-size: 12px;
+    word-break: break-word;
+}
 </style>
 </head>
 <body>
+<div id="login-overlay" class="login-overlay hidden">
+    <form id="login-form" class="login-form">
+        <h2>Connect to ClickHouse</h2>
+        <div id="login-error" class="login-error hidden"></div>
+        <label>URL
+            <input type="text" id="login-url" autocomplete="url" placeholder="https://host:8443/">
+        </label>
+        <label>User
+            <input type="text" id="login-user" autocomplete="username" placeholder="default">
+        </label>
+        <label>Password
+            <input type="password" id="login-password" autocomplete="current-password">
+        </label>
+        <button type="submit">Connect</button>
+    </form>
+</div>
 <div class="container">
     <header>
         <h1>Alexey Prompts</h1>
@@ -615,14 +687,56 @@ mark.search-hit.current { background: #f88; color: #000; }
 <script>
 const ansiUp = new AnsiUp();
 
-const CH_URL = 'http://localhost:8123/'
-const CH_USER = 'default';
-const CH_PASSWORD = '';
+// Defaults; overridden by credentials saved in the browser's credential manager
+// and by the login form. The URL is carried in the PasswordCredential's `name`.
+let CH_URL = 'http://localhost:8123/';
+let CH_USER = 'default';
+let CH_PASSWORD = '';
 
-function chHeaders() {
-    if (!CH_USER) return {};
-    return { 'Authorization': 'Basic ' + btoa(CH_USER + ':' + CH_PASSWORD) };
+const CREDS_SUPPORTED = 'credentials' in navigator && 'PasswordCredential' in window;
+
+// Load any credential the browser already has for this origin (no user prompt).
+async function loadSavedCredentials() {
+    if (!CREDS_SUPPORTED) return false;
+    try {
+        const cred = await navigator.credentials.get({ password: true, mediation: 'silent' });
+        if (cred && cred.password != null) {
+            if (cred.id) CH_USER = cred.id;
+            CH_PASSWORD = cred.password || '';
+            if (cred.name) CH_URL = cred.name;
+            return true;
+        }
+    } catch (e) { /* unsupported / blocked — fall through to the login form */ }
+    return false;
 }
+
+// Persist the current credentials in the browser's credential manager.
+async function saveCredentials() {
+    // PasswordCredential requires a non-empty password and a secure context.
+    if (!CREDS_SUPPORTED || !CH_PASSWORD) return;
+    try {
+        await navigator.credentials.store(new PasswordCredential({
+            id: CH_USER,
+            password: CH_PASSWORD,
+            name: CH_URL,
+        }));
+    } catch (e) { /* ignore storage failures */ }
+}
+
+// Build the request URL the same way ClickHouse play.html does: auth goes in the
+// query string and add_http_cors_header=1 makes the server return CORS headers, so
+// cross-origin requests succeed. A Basic Authorization header would instead need the
+// server to allow it in the CORS preflight, which it doesn't by default.
+function chRequestUrl() {
+    let url = CH_URL + (CH_URL.indexOf('?') >= 0 ? '&' : '?') + 'add_http_cors_header=1';
+    if (CH_USER) url += '&user=' + encodeURIComponent(CH_USER);
+    if (CH_PASSWORD) url += '&password=' + encodeURIComponent(CH_PASSWORD);
+    return url;
+}
+
+// Dummy Authorization header that suppresses the browser's native basic-auth dialog
+// on a 401 (same trick as play.html); ClickHouse ignores this unknown scheme.
+const CH_HEADERS = { 'Authorization': 'never' };
 
 // Model pricing per million tokens
 const PRICING = {
@@ -658,14 +772,28 @@ function computeCost(row) {
 }
 
 async function queryClickHouse(sql) {
-    const resp = await fetch(CH_URL, {
-        method: 'POST',
-        headers: chHeaders(),
-        body: sql + '\nFORMAT JSON',
-    });
+    let resp;
+    try {
+        resp = await fetch(chRequestUrl(), {
+            method: 'POST',
+            headers: CH_HEADERS,
+            body: sql + '\nFORMAT JSON',
+        });
+    } catch (e) {
+        // Network failure (wrong host, refused, CORS, mixed content) — treat as a
+        // connection/credentials problem so the login form is offered.
+        const err = new Error(`Cannot reach ${CH_URL || '(no URL)'}: ${e.message}`);
+        err.credsError = true;
+        throw err;
+    }
     if (!resp.ok) {
         const text = await resp.text();
-        throw new Error(`ClickHouse error ${resp.status}: ${text.slice(0, 500)}`);
+        const err = new Error(`ClickHouse error ${resp.status}: ${text.slice(0, 500)}`);
+        // 401/403, or ClickHouse "Authentication failed" (code 516) -> bad credentials.
+        if (resp.status === 401 || resp.status === 403 || /authentication failed|code:\s*516/i.test(text)) {
+            err.credsError = true;
+        }
+        throw err;
     }
     const json = await resp.json();
     return json.data || [];
@@ -927,6 +1055,10 @@ ORDER BY started DESC`;
         renderSessionList();
     } catch (e) {
         loading.classList.add('hidden');
+        if (e.credsError) {
+            showLoginForm(e.message);
+            return;
+        }
         errEl.textContent = e.message;
         errEl.classList.remove('hidden');
     }
@@ -1148,9 +1280,9 @@ WHERE toString(data.message.content) ILIKE '%${escaped}%'
    OR data.toolUseResult.stderr::String ILIKE '%${escaped}%'
    OR data.summary::String ILIKE '%${escaped}%'
 GROUP BY session_id`;
-        const resp = await fetch(CH_URL, {
+        const resp = await fetch(chRequestUrl(), {
             method: 'POST',
-            headers: chHeaders(),
+            headers: CH_HEADERS,
             body: sql + ' FORMAT JSON',
             signal: controller.signal,
         });
@@ -1927,8 +2059,36 @@ window.addEventListener('hashchange', handleRoute);
 window.addEventListener('resize', updateStickyOffset);
 document.getElementById('back-btn').addEventListener('click', () => navigateTo(''));
 
+// --- Login form ---
+function showLoginForm(message) {
+    document.getElementById('login-url').value = CH_URL;
+    document.getElementById('login-user').value = CH_USER;
+    document.getElementById('login-password').value = CH_PASSWORD;
+    const errEl = document.getElementById('login-error');
+    if (message) {
+        errEl.textContent = message;
+        errEl.classList.remove('hidden');
+    } else {
+        errEl.classList.add('hidden');
+    }
+    document.getElementById('login-overlay').classList.remove('hidden');
+    document.getElementById('login-password').focus();
+}
+
+document.getElementById('login-form').addEventListener('submit', e => {
+    e.preventDefault();
+    CH_URL = document.getElementById('login-url').value.trim();
+    CH_USER = document.getElementById('login-user').value.trim();
+    CH_PASSWORD = document.getElementById('login-password').value;
+    document.getElementById('login-overlay').classList.add('hidden');
+    saveCredentials();
+    loadSessions().then(() => handleRoute());
+});
+
 // --- Init ---
-loadSessions().then(() => handleRoute());
+loadSavedCredentials()
+    .then(() => loadSessions())
+    .then(() => handleRoute());
 </script>
 </body>
 </html>
