@@ -979,16 +979,24 @@ async function loadLineStats() {
     // columns (see schema.sql) and just sums them per session -- no ARRAY JOIN
     // over data.message.content, so this no longer scans the multi-GB content
     // column on every page load.
+    // FINAL: raw is a ReplacingMergeTree; re-uploaded rows (the incremental
+    // script re-sends grown sessions whole) collapse only on a background merge.
+    // Without FINAL, un-merged duplicates get summed twice and inflate the
+    // per-session line counts.
     const sql = `SELECT
     data.sessionId::String AS session_id,
     sum(lines_added) AS lines_added,
     sum(lines_removed) AS lines_removed
-FROM claude_code.raw
+FROM claude_code.raw FINAL
 GROUP BY session_id`;
     return await queryClickHouse(sql);
 }
 
 async function loadClassifications() {
+    // No FINAL: the live classification table is a plain (Shared)MergeTree, which
+    // doesn't support FINAL. Any duplicate session_id rows are collapsed
+    // client-side -- loadSessions builds a Map keyed by session_id below, so the
+    // last row per session wins.
     const sql = `SELECT data.session_id::String AS session_id, data.remarkable::Bool AS remarkable, data.remarkable_reason::String AS remarkable_reason, data.user_corrected_agent::Bool AS user_corrected_agent, data.correction_detail::String AS correction_detail, data.agent_was_right::Bool AS agent_was_right, data.agent_right_detail::String AS agent_right_detail, data.sensitive_info::Bool AS sensitive_info, data.sensitive_detail::String AS sensitive_detail FROM claude_code.classification`;
     return await queryClickHouse(sql);
 }
@@ -1005,6 +1013,9 @@ async function loadSessions() {
         // text preview (first_question_text) and the extracted plan reference (plan_ref).
         // Trivial fields read straight from the (hinted) JSON; content-derived
         // values use materialized columns so this never scans data.message.content.
+        // FINAL: raw is a ReplacingMergeTree and re-uploads re-insert whole
+        // sessions, so un-merged duplicate rows would double-count tokens/msgs/
+        // durations until the next background merge. FINAL dedups at query time.
         const sql = `SELECT
     session_id, project, started, ended, total_duration_sec,
     user_msgs, assistant_msgs, all_msgs,
@@ -1052,7 +1063,7 @@ SELECT
     countIf(data.type::String = 'system' AND data.subtype::String IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
     countIf(is_approved) AS approved_count,
     countIf(is_rejected) AS rejected_count
-FROM claude_code.raw
+FROM claude_code.raw FINAL
 WHERE path NOT LIKE '%history.jsonl'
 GROUP BY session_id, project
 HAVING user_msgs > 0
@@ -1290,6 +1301,10 @@ async function fullTextSearch(query) {
         // doing so forces a full read of that large column and defeats the
         // index. Every matched row already contains the term, so ranking by
         // message kind is enough.
+        // No FINAL here (unlike the aggregate/transcript queries): this only
+        // computes set membership and a min() relevance per session, both of
+        // which are unchanged by ReplacingMergeTree duplicates -- so FINAL would
+        // only add merge cost and risk weakening text-index granule pruning.
         const sql = `SELECT
     data.sessionId::String AS session_id,
     min(multiIf(
@@ -1364,7 +1379,7 @@ async function loadTranscript(sessionId) {
     data.toolUseResult.content::String AS tool_result_content,
     data.toolUseResult.stdout::String AS tool_result_stdout,
     data.toolUseResult.stderr::String AS tool_result_stderr
-FROM claude_code.raw
+FROM claude_code.raw FINAL
 WHERE data.sessionId::String IN (${inClause})
 ORDER BY ts`;
         transcriptData = await queryClickHouse(sql);
