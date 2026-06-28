@@ -974,20 +974,6 @@ function mergePlanSessions() {
     sessions = sessions.filter(s => !planIds.has(s.session_id));
 }
 
-async function loadLineStats() {
-    // Reads the precomputed per-row lines_added/lines_removed materialized
-    // columns (see schema.sql) and just sums them per session -- no ARRAY JOIN
-    // over data.message.content, so this no longer scans the multi-GB content
-    // column on every page load.
-    const sql = `SELECT
-    data.sessionId::String AS session_id,
-    sum(lines_added) AS lines_added,
-    sum(lines_removed) AS lines_removed
-FROM claude_code.raw
-GROUP BY session_id`;
-    return await queryClickHouse(sql);
-}
-
 async function loadClassifications() {
     const sql = `SELECT data.session_id::String AS session_id, data.remarkable::Bool AS remarkable, data.remarkable_reason::String AS remarkable_reason, data.user_corrected_agent::Bool AS user_corrected_agent, data.correction_detail::String AS correction_detail, data.agent_was_right::Bool AS agent_was_right, data.agent_right_detail::String AS agent_right_detail, data.sensitive_info::Bool AS sensitive_info, data.sensitive_detail::String AS sensitive_detail FROM claude_code.classification`;
     return await queryClickHouse(sql);
@@ -1003,75 +989,32 @@ async function loadSessions() {
         // Compact per-session index for ALL sessions: numbers + short strings only.
         // The full first-message blob is NOT transferred; instead we send a 300-char
         // text preview (first_question_text) and the extracted plan reference (plan_ref).
-        // Trivial fields read straight from the (hinted) JSON; content-derived
-        // values use materialized columns so this never scans data.message.content.
+        // Reads the claude_code.sessions view, which finalizes the per-session
+        // aggregates maintained incrementally by the sessions_mv materialized
+        // view (see schema.sql) -- no scan of raw on page load.
         const sql = `SELECT
     session_id, project, started, ended, total_duration_sec,
     user_msgs, assistant_msgs, all_msgs,
     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-    api_duration_ms, summary, model, git_branch,
+    api_duration_ms, summary, model, git_branch, lines_added, lines_removed,
     plan_count, compaction_count, approved_count, rejected_count,
     substring(fq_full, 1, 300) AS first_question_text,
     if(fq_full LIKE 'Implement the following plan:%',
         extract(fq_full, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[.]jsonl'),
         '') AS plan_ref
-FROM (
-SELECT
-    data.sessionId::String AS session_id,
-    project,
-    min(ts) AS started,
-    max(ts) AS ended,
-    dateDiff('second', started, ended) AS total_duration_sec,
-    countIf(data.type::String = 'user'
-        AND content_kind = 'String'
-        AND data.isMeta::Bool = false
-        AND NOT user_text LIKE '<command-name>%'
-        AND NOT user_text LIKE 'Implement the following plan:%'
-        AND NOT user_text LIKE '[Request interrupted by user%'
-        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
-        AND NOT user_text LIKE '%<task-notification>%'
-    ) AS user_msgs,
-    countIf(data.type::String = 'assistant') AS assistant_msgs,
-    countIf(data.type::String = 'user') + countIf(data.type::String = 'assistant') AS all_msgs,
-    sum(data.message.usage.input_tokens::UInt64) AS input_tokens,
-    sum(data.message.usage.output_tokens::UInt64) AS output_tokens,
-    sum(data.message.usage.cache_read_input_tokens::UInt64) AS cache_read_tokens,
-    sum(data.message.usage.cache_creation_input_tokens::UInt64) AS cache_creation_tokens,
-    sumIf(data.durationMs::UInt32, data.type::String = 'system' AND data.subtype::String = 'turn_duration') AS api_duration_ms,
-    anyIf(data.summary::String, data.type::String = 'summary' AND data.summary::String != '') AS summary,
-    anyIf(data.message.model::String, data.type::String = 'assistant' AND data.message.model::String NOT IN ('', '<synthetic>')) AS model,
-    anyIf(data.gitBranch::String, data.gitBranch::String != '') AS git_branch,
-    argMinIf(user_text, ts,
-        data.type::String = 'user' AND content_kind = 'String' AND data.isMeta::Bool = false
-        AND NOT user_text LIKE '<command-name>%'
-        AND NOT user_text LIKE '[Request interrupted by user%'
-        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
-        AND NOT user_text LIKE '%<task-notification>%'
-    ) AS fq_full,
-    countIf(is_plan) AS plan_count,
-    countIf(data.type::String = 'system' AND data.subtype::String IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
-    countIf(is_approved) AS approved_count,
-    countIf(is_rejected) AS rejected_count
-FROM claude_code.raw
-WHERE path NOT LIKE '%history.jsonl'
-GROUP BY session_id, project
-HAVING user_msgs > 0
-)
+FROM claude_code.sessions
 ORDER BY started DESC`;
-        const [sessionRows, lineRows, classRows] = await Promise.all([
+        const [sessionRows, classRows] = await Promise.all([
             queryClickHouse(sql),
-            loadLineStats().catch(() => []),
             loadClassifications().catch(() => [])
         ]);
         sessions = sessionRows;
-        const lineMap = new Map(lineRows.map(r => [r.session_id, r]));
         const classMap = new Map(classRows.map(r => [r.session_id, r]));
         sessions.forEach(s => {
             s.cost = computeCost(s);
             s.total_tokens = (Number(s.input_tokens) || 0) + (Number(s.output_tokens) || 0) + (Number(s.cache_read_tokens) || 0) + (Number(s.cache_creation_tokens) || 0);
-            const ls = lineMap.get(s.session_id);
-            s.lines_added = ls ? Number(ls.lines_added) || 0 : 0;
-            s.lines_removed = ls ? Number(ls.lines_removed) || 0 : 0;
+            s.lines_added = Number(s.lines_added) || 0;
+            s.lines_removed = Number(s.lines_removed) || 0;
             const cl = classMap.get(s.session_id);
             const toBool = v => v === true || v === 1 || v === '1' || v === 'true';
             s.remarkable = cl && toBool(cl.remarkable);
