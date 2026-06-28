@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
     is_approved  UInt8  MATERIALIZED data.type::String = 'user' AND arrayExists((t, e) -> t::String = 'tool_result' AND (e::String = 'false' OR e::String = ''), data.message.content[].type, data.message.content[].is_error),
     is_rejected  UInt8  MATERIALIZED data.type::String = 'user' AND arrayExists((t, e, c) -> t::String = 'tool_result' AND e::String = 'true' AND c::String LIKE '%tool use was rejected%', data.message.content[].type, data.message.content[].is_error, data.message.content[].content),
 
+    -- Lines added/removed per row (summed across the row's Edit/Write tool calls),
+    -- so the session list sums small typed columns instead of ARRAY JOINing the
+    -- content on every load.
+    lines_added   UInt32 MATERIALIZED
+        arraySum(arrayMap((t, n, s) -> if(t::String = 'tool_use' AND n::String = 'Edit' AND s::String != '', countSubstrings(s::String, '\n') + 1, 0), data.message.content[].type, data.message.content[].name, data.message.content[].input.new_string))
+      + arraySum(arrayMap((t, n, c) -> if(t::String = 'tool_use' AND n::String = 'Write' AND c::String != '', countSubstrings(c::String, '\n') + 1, 0), data.message.content[].type, data.message.content[].name, data.message.content[].input.content)),
+    lines_removed UInt32 MATERIALIZED
+        arraySum(arrayMap((t, n, o) -> if(t::String = 'tool_use' AND n::String = 'Edit' AND o::String != '', countSubstrings(o::String, '\n') + 1, 0), data.message.content[].type, data.message.content[].name, data.message.content[].input.old_string)),
+
     -- Lowercased, concatenated searchable text + an ngram text index, so
     -- substring search (search_text LIKE '%term%') prunes granules instead of
     -- scanning every row's content. To benefit at query time:

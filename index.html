@@ -975,25 +975,15 @@ function mergePlanSessions() {
 }
 
 async function loadLineStats() {
+    // Reads the precomputed per-row lines_added/lines_removed materialized
+    // columns (see schema.sql) and just sums them per session -- no ARRAY JOIN
+    // over data.message.content, so this no longer scans the multi-GB content
+    // column on every page load.
     const sql = `SELECT
     data.sessionId::String AS session_id,
-    sumIf(
-        countSubstrings(block.input.new_string::String, char(10)) + 1,
-        block.type::String = 'tool_use' AND block.name::String = 'Edit' AND block.input.new_string::String != ''
-    ) + sumIf(
-        countSubstrings(block.input.content::String, char(10)) + 1,
-        block.type::String = 'tool_use' AND block.name::String = 'Write' AND block.input.content::String != ''
-    ) AS lines_added,
-    sumIf(
-        countSubstrings(block.input.old_string::String, char(10)) + 1,
-        block.type::String = 'tool_use' AND block.name::String = 'Edit' AND block.input.old_string::String != ''
-    ) AS lines_removed
+    sum(lines_added) AS lines_added,
+    sum(lines_removed) AS lines_removed
 FROM claude_code.raw
-ARRAY JOIN data.message.content::Array(JSON) AS block
-WHERE data.type::String = 'assistant'
-    AND content_kind LIKE 'Array%'
-    AND block.type::String = 'tool_use'
-    AND block.name::String IN ('Edit', 'Write')
 GROUP BY session_id`;
     return await queryClickHouse(sql);
 }
