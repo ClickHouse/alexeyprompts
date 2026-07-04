@@ -83,5 +83,13 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
     search_text String MATERIALIZED lower(toString(data.message.content) || ' ' || data.toolUseResult.content::String || ' ' || data.toolUseResult.stdout::String || ' ' || data.toolUseResult.stderr::String || ' ' || data.summary::String),
     INDEX idx_search search_text TYPE text(tokenizer = 'ngrams') GRANULARITY 1
 )
+-- ReplacingMergeTree collapses rows with equal ORDER BY keys, but only when the
+-- parts holding them are merged. The incremental upload re-sends grown sessions
+-- whole, so duplicate rows live in separate parts until the next background
+-- merge. Interactive queries that aggregate (sums, counts) or list rows must add
+-- FINAL to dedup at read time -- otherwise un-merged duplicates double-count
+-- tokens/lines/messages and render duplicate transcript rows. (Membership/min-
+-- only queries, e.g. the full-text search, are dup-invariant and skip FINAL.)
+-- On ClickHouse Cloud this becomes SharedReplacingMergeTree, which supports FINAL.
 ENGINE = ReplacingMergeTree
 ORDER BY (data.sessionId::String, data.timestamp::String, data.uuid::String);
