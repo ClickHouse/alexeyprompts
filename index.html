@@ -367,6 +367,11 @@ mark.search-hit.current { background: #f88; color: #000; }
     cursor: pointer;
 }
 
+/* Answer to an agent question, shown as a user prompt: bright answer, dim question below. */
+.qa-item { margin-bottom: 6px; }
+.qa-a { color: #fff; font-weight: bold; white-space: pre-wrap; }
+.qa-q { color: #9aa; font-weight: normal; white-space: pre-wrap; font-size: 90%; margin-top: 2px; }
+
 .term-block.type-assistant {
     background: #112218;
     padding-bottom: 0;
@@ -1378,7 +1383,8 @@ async function loadTranscript(sessionId) {
     data.isMeta::Bool AS is_meta,
     data.toolUseResult.content::String AS tool_result_content,
     data.toolUseResult.stdout::String AS tool_result_stdout,
-    data.toolUseResult.stderr::String AS tool_result_stderr
+    data.toolUseResult.stderr::String AS tool_result_stderr,
+    toJSONString(data.^toolUseResult) AS tool_result_json
 FROM claude_code.raw FINAL
 WHERE data.sessionId::String IN (${inClause})
 ORDER BY ts`;
@@ -1437,6 +1443,18 @@ function parseContentBlocks(contentStr) {
     // Treat as plain text
     return [{ type: 'text', text: contentStr }];
 }
+
+/// Concatenated text of all tool_result blocks in a message.
+function toolResultBlocksText(blocks) {
+    return blocks.filter(b => b.type === 'tool_result').map(b =>
+        typeof b.content === 'string' ? b.content :
+        Array.isArray(b.content) ? b.content.map(c => c.text || '').join('\n') :
+        (b.content != null ? JSON.stringify(b.content) : '')
+    ).join('\n');
+}
+
+/// Sentence the harness prepends to an AskUserQuestion answer's tool_result text.
+const QUESTION_ANSWER_PREFIX = 'Your questions have been answered:';
 
 // Slash-command and local-command wrappers, e.g.
 //   <command-message>continue-pr</command-message>
@@ -1551,6 +1569,20 @@ function classifyMessage(msg) {
     // User message subtypes
     const isToolResult = blocks.length > 0 && blocks.every(b => b.type === 'tool_result');
     const textContent = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
+    /// The user's answer to an agent question (the AskUserQuestion tool) is recorded as a user
+    /// message whose only content is a tool_result. Classified as a plain tool_result it would
+    /// be hidden as dim tool output; instead surface it as genuine user input. The harness
+    /// prefixes the result text with QUESTION_ANSWER_PREFIX and also stores the structured
+    /// choices in toolUseResult.answers (projected as tool_result_json).
+    const toolResultText = toolResultBlocksText(blocks);
+    let answers = null;
+    if (msg.tool_result_json) {
+        try {
+            const tur = JSON.parse(msg.tool_result_json);
+            if (tur && tur.answers && typeof tur.answers === 'object' && Object.keys(tur.answers).length) answers = tur.answers;
+        } catch (e) {}
+    }
+    const isQuestionAnswer = isToolResult && (answers !== null || toolResultText.trim().startsWith(QUESTION_ANSWER_PREFIX));
     const isAgentNotification = !isToolResult && /<task-notification>/.test(textContent);
     const isMeta = msg.is_meta === true || msg.is_meta === 'true' || msg.is_meta === 1;
     const isSkill = !isToolResult && !isAgentNotification && isMeta;
@@ -1559,14 +1591,15 @@ function classifyMessage(msg) {
     const isContinuation = !isToolResult && !isAgentNotification && !isSkill && !isPlan && !isInterrupt && /This session is being continued from a previous conversation/.test(textContent);
 
     let category = 'user';
-    if (isToolResult) category = 'tool_result';
+    if (isQuestionAnswer) category = 'question_answer';
+    else if (isToolResult) category = 'tool_result';
     else if (isAgentNotification) category = 'agent_notification';
     else if (isSkill) category = 'skill';
     else if (isPlan) category = 'plan';
     else if (isInterrupt) category = 'interrupt';
     else if (isContinuation) category = 'continuation';
 
-    return { category, blocks, isSidechain, isToolResult, isAgentNotification, isSkill, isPlan, isInterrupt, isContinuation };
+    return { category, blocks, isSidechain, isToolResult, isAgentNotification, isSkill, isPlan, isInterrupt, isContinuation, answers, toolResultText };
 }
 
 function countMessages(data) {
@@ -1579,6 +1612,7 @@ function countMessages(data) {
             counts.tools += cl.toolUseCount;
         } else if (cl.category === 'tool_result') counts.results++;
         else if (cl.category === 'user') counts.user++;
+        else if (cl.category === 'question_answer') counts.user++;
         else if (cl.category === 'agent_notification') counts.agent++;
         else if (cl.category === 'skill') counts.skill++;
         else if (cl.category === 'plan') counts.plan++;
@@ -1674,6 +1708,22 @@ function renderTranscript() {
         return `<div style="white-space:pre-wrap">${renderAnsi(text)}</div>`;
     }
 
+    /// Render the user's answer(s) to an agent question. Prefers the structured
+    /// { question: answer } map; falls back to the harness result sentence. Leads with the
+    /// answer (the actual user input); the question follows dim as context.
+    function renderQuestionAnswer(answers, fallbackText) {
+        if (answers && Object.keys(answers).length) {
+            return Object.entries(answers).map(([q, a]) =>
+                `<div class="qa-item"><div class="qa-a">${escapeHtml(String(a))}</div>` +
+                `<div class="qa-q">in reply to: ${escapeHtml(q)}</div></div>`
+            ).join('');
+        }
+        const cleaned = (fallbackText || '')
+            .replace(/^Your questions have been answered:\s*/, '')
+            .replace(/\s*You can now continue with these answers in mind\.\s*$/, '');
+        return `<div class="qa-item"><div class="qa-a" style="white-space:pre-wrap">${renderAnsi(cleaned || fallbackText || '')}</div></div>`;
+    }
+
     for (let mi = 0; mi < transcriptData.length; mi++) {
         const msg = transcriptData[mi];
         currentMsgIdx = mi;
@@ -1688,7 +1738,7 @@ function renderTranscript() {
             continue;
         }
 
-        const validCategories = ['user','assistant','tool_result','agent_notification','skill','plan','interrupt','continuation'];
+        const validCategories = ['user','question_answer','assistant','tool_result','agent_notification','skill','plan','interrupt','continuation'];
         if (!validCategories.includes(cl.category)) continue;
 
         // Apply filters
@@ -1699,6 +1749,8 @@ function renderTranscript() {
         if (cl.category === 'interrupt' && !filters.interrupt) continue;
         if (cl.category === 'continuation' && !filters.continuation) continue;
         if (cl.category === 'user' && !filters.user) continue;
+        /// Answers to agent questions are genuine user input; show them under the User filter.
+        if (cl.category === 'question_answer' && !filters.user) continue;
 
         const blocks = cl.blocks;
 
@@ -1748,6 +1800,15 @@ function renderTranscript() {
             interrupt:          '\u2716',
             continuation:       '\u2026',
         };
+        // An answer to an agent question renders as a user prompt (user icon + nav), showing
+        // the chosen answer(s) rather than the raw tool_result wrapper.
+        if (cl.category === 'question_answer') {
+            const bodyHtml = renderQuestionAnswer(cl.answers, cl.toolResultText);
+            if (!bodyHtml.trim()) continue;
+            emit('user', prefixMap.user, bodyHtml, msg, isSidechain);
+            continue;
+        }
+
         const prefix = prefixMap[cl.category] || '';
 
         let bodyHtml = '';
@@ -2028,10 +2089,10 @@ function buildCumulativeMetrics() {
             thoughts += cl.thinkingCount;
             tools += cl.toolUseCount;
         }
-        // User prompts (real user messages)
+        // User prompts (real user messages, including answers to agent questions)
         if (msg.type === 'user') {
             const cl = classifyMessage(msg);
-            if (cl.category === 'user') userPrompts++;
+            if (cl.category === 'user' || cl.category === 'question_answer') userPrompts++;
             if (cl.category === 'plan') plans++;
         }
 
