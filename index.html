@@ -84,6 +84,19 @@ header h1 {
 
 .search-box input:focus { border-color: var(--accent); }
 
+.automation-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+
+.automation-toggle input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+
 .search-box::before {
     content: '\1F50D';
     position: absolute;
@@ -648,6 +661,9 @@ mark.search-hit.current { background: #f88; color: #000; }
         <div class="search-box">
             <input type="text" id="search-input" placeholder="Search all message content...">
         </div>
+        <label class="automation-toggle" title="Show sessions started by an automation (a lone '/continue-pr URL' prompt)">
+            <input type="checkbox" id="filter-automations"> Include automations
+        </label>
         <div class="stats-bar" id="stats-bar"></div>
     </header>
 
@@ -838,6 +854,7 @@ let sortCol = 'started';
 let sortDir = 'desc';
 let sortByUser = false; // true when user clicked a column header during search
 let searchText = '';
+let includeAutomations = false; // when false, hide sessions whose only first prompt is "/continue-pr URL"
 let fullTextSessionIds = null; // null = no full-text filter; Map session_id -> relevance rank (lower = better)
 let transcriptData = null;
 
@@ -1028,6 +1045,7 @@ async function loadSessions() {
     api_duration_ms, summary, model, git_branch,
     plan_count, compaction_count, approved_count, rejected_count,
     substring(fq_full, 1, 300) AS first_question_text,
+    substring(first_prompt_raw, 1, 500) AS first_prompt_raw,
     if(fq_full LIKE 'Implement the following plan:%',
         extract(fq_full, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[.]jsonl'),
         '') AS plan_ref
@@ -1064,6 +1082,12 @@ SELECT
         AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
         AND NOT user_text LIKE '%<task-notification>%'
     ) AS fq_full,
+    argMinIf(user_text, ts,
+        data.type::String = 'user' AND content_kind = 'String' AND data.isMeta::Bool = false
+        AND NOT user_text LIKE '[Request interrupted by user%'
+        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
+        AND NOT user_text LIKE '%<task-notification>%'
+    ) AS first_prompt_raw,
     countIf(is_plan) AS plan_count,
     countIf(data.type::String = 'system' AND data.subtype::String IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
     countIf(is_approved) AS approved_count,
@@ -1130,10 +1154,29 @@ function updateStats(filtered, shown) {
     `;
 }
 
+// An "automation" session is one whose first prompt is a lone "/continue-pr URL"
+// slash command with no extra text after the URL. These are triggered by tooling
+// rather than a person, so they're hidden from the list unless "Include
+// automations" is checked.
+function isAutomationSession(row) {
+    const raw = row.first_prompt_raw || '';
+    if (!COMMAND_TAG_RE.test(raw)) return false;
+    const name = extractTag(raw, 'command-name');
+    const message = extractTag(raw, 'command-message');
+    const cmdName = name || (message ? '/' + message : null);
+    if (cmdName !== '/continue-pr') return false;
+    const args = (extractTag(raw, 'command-args') || '').trim();
+    // "nothing else": args must be a single token (the URL) with no trailing text.
+    return args !== '' && !/\s/.test(args);
+}
+
 function getFilteredSessions() {
     let list = sessions;
     if (fullTextSessionIds) {
         list = list.filter(s => fullTextSessionIds.has(s.session_id));
+    }
+    if (!includeAutomations) {
+        list = list.filter(s => !isAutomationSession(s));
     }
     return list;
 }
@@ -1289,6 +1332,11 @@ document.getElementById('search-input').addEventListener('input', e => {
     }
     sortByUser = false;
     searchTimeout = setTimeout(() => fullTextSearch(searchText), 400);
+});
+
+document.getElementById('filter-automations').addEventListener('change', e => {
+    includeAutomations = e.target.checked;
+    renderSessionList();
 });
 
 async function fullTextSearch(query) {
