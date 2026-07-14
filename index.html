@@ -1432,7 +1432,7 @@ async function loadTranscript(sessionId) {
     data.toolUseResult.content::String AS tool_result_content,
     data.toolUseResult.stdout::String AS tool_result_stdout,
     data.toolUseResult.stderr::String AS tool_result_stderr,
-    toJSONString(data.^toolUseResult) AS tool_result_json
+    tool_result_answers
 FROM claude_code.raw FINAL
 WHERE data.sessionId::String IN (${inClause})
 ORDER BY ts`;
@@ -1621,13 +1621,15 @@ function classifyMessage(msg) {
     /// message whose only content is a tool_result. Classified as a plain tool_result it would
     /// be hidden as dim tool output; instead surface it as genuine user input. The harness
     /// prefixes the result text with QUESTION_ANSWER_PREFIX and also stores the structured
-    /// choices in toolUseResult.answers (projected as tool_result_json).
+    /// choices in toolUseResult.answers, materialized into the tool_result_answers
+    /// column (see schema.sql -- reconstructing the whole toolUseResult at read
+    /// time to grab this one field was the session-viewer's main slowdown).
     const toolResultText = toolResultBlocksText(blocks);
     let answers = null;
-    if (msg.tool_result_json) {
+    if (msg.tool_result_answers) {
         try {
-            const tur = JSON.parse(msg.tool_result_json);
-            if (tur && tur.answers && typeof tur.answers === 'object' && Object.keys(tur.answers).length) answers = tur.answers;
+            const a = JSON.parse(msg.tool_result_answers);
+            if (a && typeof a === 'object' && Object.keys(a).length) answers = a;
         } catch (e) {}
     }
     const isQuestionAnswer = isToolResult && (answers !== null || toolResultText.trim().startsWith(QUESTION_ANSWER_PREFIX));
