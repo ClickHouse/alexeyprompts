@@ -61,6 +61,22 @@ CREATE TABLE IF NOT EXISTS claude_code.raw
     is_approved  UInt8  MATERIALIZED data.type::String = 'user' AND arrayExists((t, e) -> t::String = 'tool_result' AND (e::String = 'false' OR e::String = ''), data.message.content[].type, data.message.content[].is_error),
     is_rejected  UInt8  MATERIALIZED data.type::String = 'user' AND arrayExists((t, e, c) -> t::String = 'tool_result' AND e::String = 'true' AND c::String LIKE '%tool use was rejected%', data.message.content[].type, data.message.content[].is_error, data.message.content[].content),
 
+    -- The AskUserQuestion answers live under data.toolUseResult.answers, but that
+    -- object is keyed by the (arbitrary) question text, so it lands in the JSON
+    -- type as dynamic paths that no typed subcolumn access (data.toolUseResult.answers)
+    -- can read back -- only a full data.^toolUseResult reconstruction retrieves it.
+    -- Doing that reconstruction in the transcript query is what made it slow: the ^
+    -- operator opens every toolUseResult subcolumn stream (file contents, patches,
+    -- tool stdout, ...) for every row in the session, so a ~900-row session read
+    -- 30+ MiB across many streams and took ~6s warm / much longer cold. The viewer
+    -- needs nothing from toolUseResult except these answers (tool output text is
+    -- already served by the toolUseResult.content/stdout/stderr scalar subcolumns),
+    -- so materialize just the answers object as one compact String at INSERT (the
+    -- reconstruction runs once, in memory, per row -- the same pattern search_text
+    -- already uses for content). The transcript read then touches one flat column.
+    -- '' when the row has no answers (JSONExtractRaw returns '' for a missing key).
+    tool_result_answers String MATERIALIZED JSONExtractRaw(toJSONString(data.^toolUseResult), 'answers'),
+
     -- Lines added/removed per row (summed across the row's Edit/Write tool calls),
     -- so the session list sums small typed columns instead of ARRAY JOINing the
     -- content on every load.
