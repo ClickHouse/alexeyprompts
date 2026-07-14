@@ -97,4 +97,4 @@ Open `index.html`.
 
 ### Do not share your sessions publicly
 
-The sessions contain tool calls and results, including fragments of arbitrary filess. They may contain sensisive info, that's why it's not recommended to share sessions publicly.
+The sessions contain tool calls and results, including fragments of arbitrary files. They may contain sensitive info, that's why it's not recommended to share sessions publicly.
