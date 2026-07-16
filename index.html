@@ -661,7 +661,7 @@ mark.search-hit.current { background: #f88; color: #000; }
         <div class="search-box">
             <input type="text" id="search-input" placeholder="Search all message content...">
         </div>
-        <label class="automation-toggle" title="Show sessions started by an automation (a lone '/continue-pr URL' prompt)">
+        <label class="automation-toggle" title="Show sessions started by an automation (a lone '/continue-pr URL' or '/continue-pr-auto URL' prompt)">
             <input type="checkbox" id="filter-automations"> Include automations
         </label>
         <div class="stats-bar" id="stats-bar"></div>
@@ -854,7 +854,7 @@ let sortCol = 'started';
 let sortDir = 'desc';
 let sortByUser = false; // true when user clicked a column header during search
 let searchText = '';
-let includeAutomations = false; // when false, hide sessions whose only first prompt is "/continue-pr URL"
+let includeAutomations = false; // when false, hide sessions whose only first prompt is "/continue-pr URL" or "/continue-pr-auto URL"
 let fullTextSessionIds = null; // null = no full-text filter; Map session_id -> relevance rank (lower = better)
 let transcriptData = null;
 
@@ -1155,7 +1155,8 @@ function updateStats(filtered, shown) {
 }
 
 // An "automation" session is one whose first prompt is a lone "/continue-pr URL"
-// slash command with no extra text after the URL. These are triggered by tooling
+// or "/continue-pr-auto URL" slash command with no extra text after the URL.
+// These are triggered by tooling
 // rather than a person, so they're hidden from the list unless "Include
 // automations" is checked.
 function isAutomationSession(row) {
@@ -1164,7 +1165,7 @@ function isAutomationSession(row) {
     const name = extractTag(raw, 'command-name');
     const message = extractTag(raw, 'command-message');
     const cmdName = name || (message ? '/' + message : null);
-    if (cmdName !== '/continue-pr') return false;
+    if (cmdName !== '/continue-pr' && cmdName !== '/continue-pr-auto') return false;
     const args = (extractTag(raw, 'command-args') || '').trim();
     // "nothing else": args must be a single token (the URL) with no trailing text.
     return args !== '' && !/\s/.test(args);
