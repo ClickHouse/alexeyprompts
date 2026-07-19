@@ -1009,6 +1009,13 @@ let searchText = '';
 let includeAutomations = false; // when false, hide sessions whose only first prompt is "/continue-pr URL" or "/continue-pr-auto URL"
 let fullTextSessionIds = null; // null = no full-text filter; Map session_id -> relevance rank (lower = better)
 let transcriptData = null;
+// Continuation families: sessions resumed/forked from another session (their first
+// message's parentUuid points into a different session file). Each family is glued
+// into one list row (see mergeContinuationSessions). These maps let a bookmarked
+// member id -- including one merged away and removed from `sessions` -- still resolve
+// to its family for the transcript view.
+let continuationFamilyOf = new Map(); // any member session_id -> [all member ids]
+let continuationRepOf = new Map();    // any member session_id -> representative session_id
 
 // --- Formatting helpers ---
 function formatDuration(sec) {
@@ -1148,6 +1155,203 @@ function mergePlanSessions() {
     sessions = sessions.filter(s => !planIds.has(s.session_id));
 }
 
+// --- Continuation (resume/fork) merging ---
+// A resumed or forked session lives in its own .jsonl file (its own sessionId) but
+// its earliest messages carry a parentUuid pointing at a message owned by the
+// session it was continued from. We find every such cross-session link, group the
+// linked sessions into families, and glue each family into a single list row.
+async function loadContinuationEdges() {
+    // For every row whose parentUuid is owned by a DIFFERENT session, emit
+    // (child session, parent session). Symmetric resume-forks that copied each
+    // other's messages produce edges both ways -- treated as undirected below.
+    // history.jsonl holds the CLI prompt history, not real messages, so skip it.
+    const sql = `WITH owner AS (
+    SELECT DISTINCT data.uuid::String AS u, data.sessionId::String AS sid FROM claude_code.raw
+)
+SELECT DISTINCT c.sid AS child, p.sid AS parent
+FROM (
+    SELECT DISTINCT data.sessionId::String AS sid, data.parentUuid::String AS pu
+    FROM claude_code.raw FINAL
+    WHERE path NOT LIKE '%history.jsonl' AND data.parentUuid::String != ''
+) c
+JOIN owner p ON c.pu = p.u
+WHERE p.sid != c.sid`;
+    return await queryClickHouse(sql);
+}
+
+async function mergeContinuationSessions(edges) {
+    if (!edges || !edges.length) return;
+    const present = new Set(sessions.map(s => s.session_id));
+
+    // Union-find over the linked sessions that are actually in the list.
+    const uf = new Map();
+    const find = x => { while (uf.get(x) !== x) { uf.set(x, uf.get(uf.get(x))); x = uf.get(x); } return x; };
+    const touch = x => { if (!uf.has(x)) uf.set(x, x); };
+    for (const e of edges) {
+        if (!present.has(e.child) || !present.has(e.parent)) continue;
+        touch(e.child); touch(e.parent);
+        uf.set(find(e.child), find(e.parent));
+    }
+    if (!uf.size) return;
+
+    const byId = new Map(sessions.map(s => [s.session_id, s]));
+    const comps = new Map(); // root -> [ids]
+    for (const id of uf.keys()) {
+        const r = find(id);
+        (comps.get(r) || comps.set(r, []).get(r)).push(id);
+    }
+
+    const families = []; // { members: [...], rep }
+    for (const members of comps.values()) {
+        if (members.length < 2) continue;
+        // Representative = the earliest-started member (the original session): it
+        // owns the original first prompt and gives a stable, meaningful URL.
+        let rep = members[0];
+        for (const m of members) {
+            if ((byId.get(m).started || '') < (byId.get(rep).started || '')) rep = m;
+        }
+        families.push({ members, rep });
+        for (const m of members) {
+            continuationFamilyOf.set(m, members);
+            continuationRepOf.set(m, rep);
+        }
+    }
+    if (!families.length) return;
+
+    // Deduped family stats. Naively summing per-session rows would double-count the
+    // shared prefix of resume-forks, so we dedup rows by uuid across the whole family
+    // (GROUP BY family_id, uuid) before aggregating. Only user/assistant/system rows
+    // -- all of which carry a uuid -- feed the counts, so collapsing the uncounted
+    // empty-uuid rows is harmless. Mirrors the aggregation in loadSessions.
+    const q = id => "'" + id.replace(/'/g, "\\'") + "'";
+    const allMembers = families.flatMap(f => f.members);
+    const fromIds = [], toIds = [];
+    for (const f of families) for (const m of f.members) if (m !== f.rep) { fromIds.push(m); toIds.push(f.rep); }
+    const memberList = allMembers.map(q).join(',');
+    const fromArr = '[' + fromIds.map(q).join(',') + ']';
+    const toArr = '[' + toIds.map(q).join(',') + ']';
+    const sql = `SELECT
+    session_id, project, started, ended, total_duration_sec,
+    user_msgs, assistant_msgs, all_msgs,
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+    api_duration_ms, summary, model, git_branch,
+    plan_count, compaction_count, approved_count, rejected_count,
+    lines_added, lines_removed,
+    substring(fq_full, 1, 300) AS first_question_text,
+    substring(first_prompt_raw, 1, 500) AS first_prompt_raw,
+    if(fq_full LIKE 'Implement the following plan:%',
+        extract(fq_full, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[.]jsonl'),
+        '') AS plan_ref
+FROM (
+SELECT
+    family_id AS session_id,
+    any(project) AS project,
+    min(ts) AS started,
+    max(ts) AS ended,
+    dateDiff('second', started, ended) AS total_duration_sec,
+    countIf(type = 'user' AND content_kind = 'String' AND is_meta = false
+        AND NOT user_text LIKE '<command-name>%'
+        AND NOT user_text LIKE '<local-command-stdout>%'
+        AND NOT user_text LIKE 'Implement the following plan:%'
+        AND NOT user_text LIKE '[Request interrupted by user%'
+        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
+        AND NOT user_text LIKE '%<task-notification>%'
+    ) AS user_msgs,
+    countIf(type = 'assistant') AS assistant_msgs,
+    countIf(type = 'user') + countIf(type = 'assistant') AS all_msgs,
+    sum(in_tok) AS input_tokens,
+    sum(out_tok) AS output_tokens,
+    sum(cr_tok) AS cache_read_tokens,
+    sum(cc_tok) AS cache_creation_tokens,
+    sumIf(duration_ms, type = 'system' AND subtype = 'turn_duration') AS api_duration_ms,
+    anyIf(summary_txt, type = 'summary' AND summary_txt != '') AS summary,
+    anyIf(model, type = 'assistant' AND model NOT IN ('', '<synthetic>')) AS model,
+    anyIf(git_branch, git_branch != '') AS git_branch,
+    argMinIf(user_text, ts,
+        type = 'user' AND content_kind = 'String' AND is_meta = false
+        AND NOT user_text LIKE '<command-name>%'
+        AND NOT user_text LIKE '<local-command-stdout>%'
+        AND NOT user_text LIKE 'Implement the following plan:%'
+        AND NOT user_text LIKE '[Request interrupted by user%'
+        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
+        AND NOT user_text LIKE '%<task-notification>%'
+    ) AS fq_full,
+    argMinIf(user_text, ts,
+        type = 'user' AND content_kind = 'String' AND is_meta = false
+        AND NOT user_text LIKE '<local-command-stdout>%'
+        AND NOT user_text LIKE '[Request interrupted by user%'
+        AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
+        AND NOT user_text LIKE '%<task-notification>%'
+    ) AS first_prompt_raw,
+    countIf(is_plan) AS plan_count,
+    countIf(type = 'system' AND subtype IN ('compact_boundary', 'microcompact_boundary')) AS compaction_count,
+    countIf(is_approved) AS approved_count,
+    countIf(is_rejected) AS rejected_count,
+    sum(la) AS lines_added,
+    sum(lr) AS lines_removed
+FROM (
+    SELECT
+        transform(data.sessionId::String, ${fromArr}, ${toArr}, data.sessionId::String) AS family_id,
+        data.uuid::String AS uuid,
+        any(project) AS project,
+        min(ts) AS ts,
+        any(data.type::String) AS type,
+        any(content_kind) AS content_kind,
+        any(data.isMeta::Bool) AS is_meta,
+        any(user_text) AS user_text,
+        any(data.message.usage.input_tokens::UInt64) AS in_tok,
+        any(data.message.usage.output_tokens::UInt64) AS out_tok,
+        any(data.message.usage.cache_read_input_tokens::UInt64) AS cr_tok,
+        any(data.message.usage.cache_creation_input_tokens::UInt64) AS cc_tok,
+        any(data.durationMs::UInt32) AS duration_ms,
+        any(data.subtype::String) AS subtype,
+        any(data.summary::String) AS summary_txt,
+        any(data.message.model::String) AS model,
+        any(data.gitBranch::String) AS git_branch,
+        any(is_plan) AS is_plan,
+        any(is_approved) AS is_approved,
+        any(is_rejected) AS is_rejected,
+        any(lines_added) AS la,
+        any(lines_removed) AS lr
+    FROM claude_code.raw FINAL
+    WHERE path NOT LIKE '%history.jsonl' AND data.sessionId::String IN (${memberList})
+    GROUP BY family_id, uuid
+)
+GROUP BY family_id
+)`;
+
+    let merged;
+    try {
+        merged = new Map((await queryClickHouse(sql)).map(r => [r.session_id, r]));
+    } catch (e) {
+        // If the family-stats query fails, leave sessions unmerged rather than break
+        // the whole list. The transcript view still glues them via continuationFamilyOf.
+        return;
+    }
+
+    const numFields = ['total_duration_sec', 'user_msgs', 'assistant_msgs', 'all_msgs',
+        'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens',
+        'api_duration_ms', 'plan_count', 'compaction_count', 'approved_count', 'rejected_count',
+        'lines_added', 'lines_removed'];
+    const strFields = ['project', 'started', 'ended', 'model', 'git_branch',
+        'first_question_text', 'first_prompt_raw', 'plan_ref', 'summary'];
+    const removeIds = new Set();
+    for (const f of families) {
+        const rep = byId.get(f.rep);
+        const m = merged.get(f.rep);
+        if (m) {
+            for (const fld of numFields) if (m[fld] !== undefined) rep[fld] = Number(m[fld]) || 0;
+            for (const fld of strFields) if (m[fld]) rep[fld] = m[fld];
+            rep.cost = computeCost(rep);
+            rep.total_tokens = (Number(rep.input_tokens) || 0) + (Number(rep.output_tokens) || 0)
+                + (Number(rep.cache_read_tokens) || 0) + (Number(rep.cache_creation_tokens) || 0);
+        }
+        rep._continuation_session_ids = f.members;
+        for (const mem of f.members) if (mem !== f.rep) removeIds.add(mem);
+    }
+    sessions = sessions.filter(s => !removeIds.has(s.session_id));
+}
+
 async function loadLineStats() {
     // Reads the precomputed per-row lines_added/lines_removed materialized
     // columns (see schema.sql) and just sums them per session -- no ARRAY JOIN
@@ -1253,10 +1457,11 @@ GROUP BY session_id, project
 HAVING user_msgs > 0
 )
 ORDER BY started DESC`;
-        const [sessionRows, lineRows, classRows] = await Promise.all([
+        const [sessionRows, lineRows, classRows, continuationEdges] = await Promise.all([
             queryClickHouse(sql),
             loadLineStats().catch(() => []),
-            loadClassifications().catch(() => [])
+            loadClassifications().catch(() => []),
+            loadContinuationEdges().catch(() => [])
         ]);
         sessions = sessionRows;
         const lineMap = new Map(lineRows.map(r => [r.session_id, r]));
@@ -1278,6 +1483,7 @@ ORDER BY started DESC`;
             s.sensitive = cl && toBool(cl.sensitive_info);
             s.sensitive_detail = cl ? cl.sensitive_detail || '' : '';
         });
+        await mergeContinuationSessions(continuationEdges);
         mergePlanSessions();
         loading.classList.add('hidden');
         renderSessionList();
@@ -1430,7 +1636,7 @@ function renderSessionList() {
         return `
         <tr data-session="${escapeHtml(s.session_id)}">
             <td><div class="col-summary-inner" title="${escapeHtml(getSummaryText(s))}">${escapeHtml(getSummaryText(s))}</div></td>
-            <td class="col-tags">${(s.remarkable ? `<span title="${escapeHtml(s.remarkable_reason)}">\u2B50</span>` : '') + (s.sensitive ? `<span title="${escapeHtml(s.sensitive_detail)}">\u26A0\uFE0F</span>` : '') + (s.user_corrected ? `<span title="${escapeHtml(s.correction_detail)}">\u270A</span>` : '') + (s.agent_right ? `<span title="${escapeHtml(s.agent_right_detail)}">\uD83D\uDD25</span>` : '')}</td>
+            <td class="col-tags">${(s.remarkable ? `<span title="${escapeHtml(s.remarkable_reason)}">\u2B50</span>` : '') + (s.sensitive ? `<span title="${escapeHtml(s.sensitive_detail)}">\u26A0\uFE0F</span>` : '') + (s.user_corrected ? `<span title="${escapeHtml(s.correction_detail)}">\u270A</span>` : '') + (s.agent_right ? `<span title="${escapeHtml(s.agent_right_detail)}">\uD83D\uDD25</span>` : '') + (s._continuation_session_ids && s._continuation_session_ids.length > 1 ? `<span title="Glued from ${s._continuation_session_ids.length} continued/forked sessions">\uD83D\uDD17</span>` : '')}</td>
             <td class="col-time">${formatTime(s.started)}</td>
             <td class="col-duration align-right" style="${bar('total_duration_sec', Number(s.total_duration_sec) || 0)}">${formatDuration(s.total_duration_sec)}</td>
             <td class="col-duration align-right" style="${bar('api_duration_ms', Number(s.api_duration_ms) || 0)}">${formatMs(s.api_duration_ms)}</td>
@@ -1544,9 +1750,13 @@ async function loadTranscript(sessionId) {
     errEl.classList.add('hidden');
     container.innerHTML = '';
 
-    // Check if this session has a merged plan session
-    const session = sessions.find(s => s.session_id === sessionId);
-    const sessionIds = [sessionId];
+    // Resolve continuation families: a bookmarked member id (even one merged away
+    // and no longer in `sessions`) maps to its whole family, so the glued transcript
+    // shows all resumed/forked branches together.
+    const familyMembers = continuationFamilyOf.get(sessionId);
+    const repId = continuationRepOf.get(sessionId) || sessionId;
+    const session = sessions.find(s => s.session_id === repId);
+    const sessionIds = familyMembers ? [...familyMembers] : [sessionId];
     if (session && session._plan_session_id) sessionIds.push(session._plan_session_id);
 
     const inClause = sessionIds.map(id => "'" + id.replace(/'/g, "\\'") + "'").join(',');
@@ -1584,9 +1794,19 @@ async function loadTranscript(sessionId) {
 FROM claude_code.raw FINAL
 WHERE data.sessionId::String IN (${inClause})
 ORDER BY ts`;
-        transcriptData = await queryClickHouse(sql);
+        const rows = await queryClickHouse(sql);
+        // Resume-forks copy a shared prefix into each member file, so the same uuid
+        // arrives from several sessions -- keep the first, drop the duplicates.
+        // Uncounted rows without a uuid are all kept.
+        const seenUuids = new Set();
+        transcriptData = rows.filter(r => {
+            if (!r.uuid) return true;
+            if (seenUuids.has(r.uuid)) return false;
+            seenUuids.add(r.uuid);
+            return true;
+        });
         loading.classList.add('hidden');
-        renderTranscriptMeta(sessionId);
+        renderTranscriptMeta(repId);
         renderTranscript();
     } catch (e) {
         loading.classList.add('hidden');
@@ -2353,7 +2573,8 @@ function updateScrollMetrics() {
 
     const wasHidden = metricsEl.style.display === 'none';
     const m = cumulativeMetrics[lastIdx];
-    const sessionId = window.location.hash.slice('#session/'.length);
+    const hashId = window.location.hash.slice('#session/'.length);
+    const sessionId = continuationRepOf.get(hashId) || hashId;
     const cost = computeCumulativeCost(m, sessionId);
 
     metricsEl.style.display = 'flex';
