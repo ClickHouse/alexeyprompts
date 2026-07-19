@@ -35,6 +35,40 @@ html { scrollbar-color: #333 #111; }
     --purple: #7c3aed;
 }
 
+/* Query progress bar — a thin bar across the top of the viewport that reflects
+   the progress of in-flight ClickHouse queries, fed by the JSONEachRowWithProgress
+   streaming format (same idea as ClickHouse's play.html). */
+#query-progress {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    z-index: 1000;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+#query-progress.active { opacity: 1; }
+#query-progress-fill {
+    height: 100%;
+    width: var(--progress, 0%);
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    transition: width 0.2s ease;
+}
+/* Shown while the total row estimate is not yet known: a chunk slides across. */
+#query-progress.indeterminate #query-progress-fill {
+    width: 30%;
+    transition: none;
+    animation: query-progress-indet 1.1s ease-in-out infinite;
+}
+@keyframes query-progress-indet {
+    0%   { margin-left: -30%; }
+    100% { margin-left: 100%; }
+}
+
 body {
     background: var(--bg);
     color: var(--text);
@@ -639,6 +673,7 @@ mark.search-hit.current { background: #f88; color: #000; }
 </style>
 </head>
 <body>
+<div id="query-progress" aria-hidden="true"><div id="query-progress-fill"></div></div>
 <div id="login-overlay" class="login-overlay hidden">
     <form id="login-form" class="login-form">
         <h2>Connect to ClickHouse</h2>
@@ -822,32 +857,114 @@ function computeCost(row) {
     ) / 1_000_000;
 }
 
-async function queryClickHouse(sql) {
-    let resp;
+// --- Query progress bar (JSONEachRowWithProgress streaming) ---
+// Every query registers here while it runs, so the top-of-page bar can show the
+// combined progress of all in-flight queries (loadSessions fires several at once).
+const chActiveQueries = new Map(); // id -> { read, total }
+let chQuerySeq = 0;
+
+function chUpdateProgressBar() {
+    const el = document.getElementById('query-progress');
+    if (!el) return;
+    if (chActiveQueries.size === 0) {
+        el.classList.remove('active', 'indeterminate');
+        el.style.setProperty('--progress', '0%');
+        return;
+    }
+    let read = 0, total = 0;
+    for (const q of chActiveQueries.values()) { read += q.read; total += q.total; }
+    el.classList.add('active');
+    if (total > 0) {
+        // total_rows_to_read is an estimate and read_rows can briefly exceed it, so clamp.
+        el.classList.remove('indeterminate');
+        el.style.setProperty('--progress', Math.min(100, 100 * read / total).toFixed(2) + '%');
+    } else {
+        // No row-count estimate yet — animate an indeterminate chunk instead.
+        el.classList.add('indeterminate');
+    }
+}
+
+// Runs a query and returns its rows. Uses the JSONEachRowWithProgress format so the
+// response streams line-by-line ({"row":...}, {"progress":...}, {"exception":...}),
+// letting us drive the progress bar as the server scans data — the same approach as
+// ClickHouse's play.html. Progress values are cumulative, so we use them directly.
+async function queryClickHouse(sql, { signal } = {}) {
+    const id = ++chQuerySeq;
+    chActiveQueries.set(id, { read: 0, total: 0 });
+    chUpdateProgressBar();
     try {
-        resp = await fetch(chRequestUrl(), {
-            method: 'POST',
-            headers: CH_HEADERS,
-            body: sql + '\nFORMAT JSON',
-        });
-    } catch (e) {
-        // Network failure (wrong host, refused, CORS, mixed content) — treat as a
-        // connection/credentials problem so the login form is offered.
-        const err = new Error(`Cannot reach ${CH_URL || '(no URL)'}: ${e.message}`);
-        err.credsError = true;
-        throw err;
-    }
-    if (!resp.ok) {
-        const text = await resp.text();
-        const err = new Error(`ClickHouse error ${resp.status}: ${text.slice(0, 500)}`);
-        // 401/403, or ClickHouse "Authentication failed" (code 516) -> bad credentials.
-        if (resp.status === 401 || resp.status === 403 || /authentication failed|code:\s*516/i.test(text)) {
+        let resp;
+        try {
+            resp = await fetch(chRequestUrl(), {
+                method: 'POST',
+                headers: { ...CH_HEADERS, 'X-ClickHouse-Format': 'JSONEachRowWithProgress' },
+                body: sql,
+                signal,
+            });
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            // Network failure (wrong host, refused, CORS, mixed content) — treat as a
+            // connection/credentials problem so the login form is offered.
+            const err = new Error(`Cannot reach ${CH_URL || '(no URL)'}: ${e.message}`);
             err.credsError = true;
+            throw err;
         }
-        throw err;
+        if (!resp.ok) {
+            // Errors caught before streaming begins come back as a normal HTTP error body.
+            const text = await resp.text();
+            const err = new Error(`ClickHouse error ${resp.status}: ${text.slice(0, 500)}`);
+            // 401/403, or ClickHouse "Authentication failed" (code 516) -> bad credentials.
+            if (resp.status === 401 || resp.status === 403 || /authentication failed|code:\s*516/i.test(text)) {
+                err.credsError = true;
+            }
+            throw err;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        const rows = [];
+        let buffer = '';
+        const handleLine = (line) => {
+            if (!line) return;
+            let obj;
+            try {
+                obj = JSON.parse(line);
+            } catch (_) {
+                // A non-JSON line means the query failed after HTTP 200 was already
+                // sent, so the server appended the error as plain text mid-stream.
+                throw new Error(`ClickHouse error: ${line.slice(0, 500)}`);
+            }
+            if (obj.row !== undefined) {
+                rows.push(obj.row);
+            } else if (obj.progress) {
+                const st = chActiveQueries.get(id);
+                if (st) {
+                    st.read = Number(obj.progress.read_rows) || 0;
+                    st.total = Number(obj.progress.total_rows_to_read) || 0;
+                    chUpdateProgressBar();
+                }
+            } else if (obj.exception) {
+                // Same failure-after-200 case, but delivered as a JSON exception line.
+                throw new Error(`ClickHouse error: ${String(obj.exception).slice(0, 500)}`);
+            }
+            // meta / totals / min / max / rows_before_* lines are not needed here.
+        };
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let nl;
+            while ((nl = buffer.indexOf('\n')) >= 0) {
+                handleLine(buffer.slice(0, nl));
+                buffer = buffer.slice(nl + 1);
+            }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) handleLine(buffer);
+        return rows;
+    } finally {
+        chActiveQueries.delete(id);
+        chUpdateProgressBar();
     }
-    const json = await resp.json();
-    return json.data || [];
 }
 
 // --- State ---
@@ -1376,15 +1493,7 @@ async function fullTextSearch(query) {
 FROM claude_code.raw
 WHERE search_text LIKE '%${escapedLower}%'
 GROUP BY session_id`;
-        const resp = await fetch(chRequestUrl(), {
-            method: 'POST',
-            headers: CH_HEADERS,
-            body: sql + ' FORMAT JSON',
-            signal: controller.signal,
-        });
-        if (!resp.ok) throw new Error(await resp.text());
-        const json = await resp.json();
-        const rows = json.data || [];
+        const rows = await queryClickHouse(sql, { signal: controller.signal });
         if (controller.signal.aborted) return;
         fullTextSessionIds = new Map(rows.map(r => [r.session_id, Number(r.relevance)]));
         renderSessionList();
