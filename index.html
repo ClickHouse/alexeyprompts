@@ -788,6 +788,7 @@ const CH_HEADERS = { 'Authorization': 'never' };
 
 // Model pricing per million tokens
 const PRICING = {
+    fable:       { input: 10, output: 50, cache_read: 1.00, cache_creation: 12.50 },
     'opus-4.5+': { input: 5, output: 25, cache_read: 0.50, cache_creation: 6.25 },
     'opus-4.0':  { input: 15, output: 75, cache_read: 1.50, cache_creation: 18.75 },
     sonnet:      { input: 3, output: 15, cache_read: 0.30, cache_creation: 3.75 },
@@ -797,6 +798,8 @@ const PRICING = {
 function detectPricingTier(model) {
     if (!model) return 'sonnet';
     const m = model.toLowerCase();
+    // Fable 5 / Mythos 5 share pricing ($10/$50 per 1M).
+    if (m.includes('fable') || m.includes('mythos')) return 'fable';
     if (m.includes('opus')) {
         // opus-4-5, opus-4-6 etc. are $5/$25; opus-4-0, opus-4-1, opus-4 (no minor) are $15/$75
         const ver = m.match(/opus-(\d+)-(\d+)/);
