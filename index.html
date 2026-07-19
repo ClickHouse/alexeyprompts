@@ -1429,7 +1429,11 @@ async function loadClassifications() {
 }
 
 // --- Session List ---
-async function loadSessions() {
+// userInvoked is true only when the load follows a user-submitted login (or an
+// explicit reconnect). On the automatic first load we stay silent on failure —
+// the login form still appears so the user can connect, but without an error
+// message, since a failure with the default/remembered credentials is expected.
+async function loadSessions(userInvoked = false) {
     const loading = document.getElementById('list-loading');
     const errEl = document.getElementById('list-error');
     loading.classList.remove('hidden');
@@ -1539,11 +1543,17 @@ ORDER BY started DESC`;
     } catch (e) {
         loading.classList.add('hidden');
         if (e.credsError) {
-            showLoginForm(e.message);
+            // Show the error text only when the user invoked the auth; on the
+            // automatic first load, offer the login form silently.
+            showLoginForm(userInvoked ? e.message : null);
             return;
         }
-        errEl.textContent = e.message;
-        errEl.classList.remove('hidden');
+        // Non-credential error (e.g. a bad query). Only surface it when the user
+        // invoked the load; stay silent on the automatic first load.
+        if (userInvoked) {
+            errEl.textContent = e.message;
+            errEl.classList.remove('hidden');
+        }
     }
 }
 
@@ -2816,7 +2826,7 @@ document.getElementById('login-form').addEventListener('submit', e => {
     CH_PASSWORD = document.getElementById('login-password').value;
     document.getElementById('login-overlay').classList.add('hidden');
     saveCredentials();
-    loadSessions().then(() => handleRoute());
+    loadSessions(true).then(() => handleRoute());
 });
 
 // --- Init ---
