@@ -1060,6 +1060,7 @@ SELECT
         AND content_kind = 'String'
         AND data.isMeta::Bool = false
         AND NOT user_text LIKE '<command-name>%'
+        AND NOT user_text LIKE '<local-command-stdout>%'
         AND NOT user_text LIKE 'Implement the following plan:%'
         AND NOT user_text LIKE '[Request interrupted by user%'
         AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
@@ -1078,12 +1079,14 @@ SELECT
     argMinIf(user_text, ts,
         data.type::String = 'user' AND content_kind = 'String' AND data.isMeta::Bool = false
         AND NOT user_text LIKE '<command-name>%'
+        AND NOT user_text LIKE '<local-command-stdout>%'
         AND NOT user_text LIKE '[Request interrupted by user%'
         AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
         AND NOT user_text LIKE '%<task-notification>%'
     ) AS fq_full,
     argMinIf(user_text, ts,
         data.type::String = 'user' AND content_kind = 'String' AND data.isMeta::Bool = false
+        AND NOT user_text LIKE '<local-command-stdout>%'
         AND NOT user_text LIKE '[Request interrupted by user%'
         AND NOT user_text LIKE '%This session is being continued from a previous conversation%'
         AND NOT user_text LIKE '%<task-notification>%'
