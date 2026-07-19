@@ -1508,6 +1508,27 @@ function toolResultBlocksText(blocks) {
     ).join('\n');
 }
 
+/// AskUserQuestion answers are a flat { question: answer } map in the raw transcript, but
+/// ClickHouse's JSON type treats a '.' in an object key as a path separator, so any question
+/// containing a dot is stored split into nested sub-objects -- e.g. the original key
+/// "(docs.html)?" becomes {"(docs":{"html)?": answer}}, and a multi-sentence question splits at
+/// every ". ". Recursively flatten back to [question, answer] pairs, re-joining the segments
+/// with the '.' the JSON type consumed to reconstruct the original question text. Leaf values
+/// are always answer strings (verified across the dataset). Without this, rendering the raw
+/// nested object as a string yields "[object Object]".
+function flattenAnswers(answers) {
+    const pairs = [];
+    const walk = (obj, prefix) => {
+        for (const [k, v] of Object.entries(obj)) {
+            const key = prefix ? `${prefix}.${k}` : k;
+            if (v !== null && typeof v === 'object') walk(v, key);
+            else pairs.push([key, String(v)]);
+        }
+    };
+    walk(answers, '');
+    return pairs;
+}
+
 /// Sentence the harness prepends to an AskUserQuestion answer's tool_result text.
 const QUESTION_ANSWER_PREFIX = 'Your questions have been answered:';
 
@@ -1770,8 +1791,8 @@ function renderTranscript() {
     /// answer (the actual user input); the question follows dim as context.
     function renderQuestionAnswer(answers, fallbackText) {
         if (answers && Object.keys(answers).length) {
-            return Object.entries(answers).map(([q, a]) =>
-                `<div class="qa-item"><div class="qa-a">${escapeHtml(String(a))}</div>` +
+            return flattenAnswers(answers).map(([q, a]) =>
+                `<div class="qa-item"><div class="qa-a">${escapeHtml(a)}</div>` +
                 `<div class="qa-q">in reply to: ${escapeHtml(q)}</div></div>`
             ).join('');
         }
