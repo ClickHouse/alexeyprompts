@@ -152,6 +152,53 @@ header h1 {
 .stats-bar span { white-space: nowrap; }
 .stats-bar .value { color: var(--text-bright); font-weight: 600; }
 
+/* Cost-by-date chart — a compact, axis-less sparkline-style bar chart above the table. */
+#cost-chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 1px;
+    height: 48px;
+    margin-bottom: 12px;
+    padding: 0;
+}
+#cost-chart:empty { display: none; }
+/* Each column spans the full height so the whole vertical strip is hoverable,
+   with the colored fill anchored to the bottom. */
+#cost-chart .col {
+    flex: 1 1 0;
+    min-width: 1px;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    cursor: pointer;
+}
+#cost-chart .fill {
+    width: 100%;
+    background: var(--accent-dim);
+    min-height: 1px;
+    transition: background 0.1s;
+}
+#cost-chart .col:hover .fill { background: var(--accent); }
+#cost-chart .col.empty .fill { background: transparent; }
+/* When a day is selected, highlight it and dim the rest. */
+#cost-chart.has-selection .col:not(.selected):not(.empty):not(:hover) .fill { background: var(--border); }
+#cost-chart .col.selected .fill { background: var(--accent); }
+#chart-tooltip .hint { color: var(--text-dim); opacity: 0.7; }
+#chart-tooltip {
+    position: fixed;
+    z-index: 100;
+    pointer-events: none;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    display: none;
+}
+#chart-tooltip .value { color: var(--text-bright); font-weight: 600; }
+
 /* Session List */
 #session-list-view { display: block; }
 #transcript-view { display: none; background: #001018; color: #ccc; margin: -16px; padding: 0; }
@@ -703,6 +750,7 @@ mark.search-hit.current { background: #f88; color: #000; }
     </header>
 
     <div id="session-list-view">
+        <div id="cost-chart"></div>
         <div class="table-wrap">
             <table id="session-table">
                 <thead>
@@ -1008,6 +1056,7 @@ let sortByUser = false; // true when user clicked a column header during search
 let searchText = '';
 let includeAutomations = false; // when false, hide sessions whose only first prompt is "/continue-pr URL" or "/continue-pr-auto URL"
 let fullTextSessionIds = null; // null = no full-text filter; Map session_id -> relevance rank (lower = better)
+let chartDayFilter = null; // null = no date filter; else a "YYYY-MM-DD" day selected by clicking a chart bar
 let transcriptData = null;
 // Continuation families: sessions resumed/forked from another session (their first
 // message's parentUuid points into a different session file). Each family is glued
@@ -1515,6 +1564,100 @@ function updateStats(filtered, shown) {
     `;
 }
 
+// Parse a ClickHouse datetime ("2026-02-13 22:56:12.795", local time, no tz)
+// down to its calendar day. Returns null if unparseable.
+function parseDay(ts) {
+    if (!ts) return null;
+    let d = new Date(ts);
+    if (isNaN(d)) d = new Date(ts.replace(' ', 'T'));
+    if (isNaN(d)) return null;
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function dayKeyToDate(key) {
+    const [y, m, d] = key.split('-').map(Number);
+    return new Date(y, m - 1, d);
+}
+
+// A compact bar chart of daily total cost, drawn above the table. One bar per
+// calendar day across the full range (zero-cost days included, so the time axis
+// stays proportional). No axes or legend; details appear in a tooltip on hover.
+function renderCostChart(filtered) {
+    const chart = document.getElementById('cost-chart');
+    if (!chart) return;
+
+    const byDay = new Map();
+    for (const s of filtered) {
+        const day = parseDay(s.started);
+        if (!day) continue;
+        byDay.set(day, (byDay.get(day) || 0) + (s.cost || 0));
+    }
+
+    if (byDay.size === 0) { chart.innerHTML = ''; return; }
+
+    // Build the continuous day range from earliest to latest.
+    const keys = [...byDay.keys()].sort();
+    const first = dayKeyToDate(keys[0]);
+    const last = dayKeyToDate(keys[keys.length - 1]);
+    const pad = n => String(n).padStart(2, '0');
+    const days = [];
+    for (let d = new Date(first); d <= last; d.setDate(d.getDate() + 1)) {
+        const key = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        days.push({ key, cost: byDay.get(key) || 0 });
+    }
+    const maxCost = days.reduce((m, d) => Math.max(m, d.cost), 0) || 1;
+
+    chart.innerHTML = days.map(d => {
+        const h = d.cost > 0 ? Math.max(2, Math.round((d.cost / maxCost) * 100)) : 0;
+        let cls = d.cost > 0 ? 'col' : 'col empty';
+        if (d.key === chartDayFilter) cls += ' selected';
+        return `<div class="${cls}" data-day="${d.key}" data-cost="${d.cost}"><div class="fill" style="height:${h}%"></div></div>`;
+    }).join('');
+    // Dim non-selected bars only when the selected day exists in this range.
+    chart.classList.toggle('has-selection', !!chartDayFilter && byDay.has(chartDayFilter));
+}
+
+// Single reusable tooltip and click-to-filter for the cost chart. Event
+// delegation on the chart container so we don't rebind on every re-render.
+function setupChartTooltip() {
+    const chart = document.getElementById('cost-chart');
+    if (!chart || chart.dataset.tipBound) return;
+    chart.dataset.tipBound = '1';
+
+    // Clicking a day filters the list to that date; clicking it again clears.
+    chart.addEventListener('click', e => {
+        const col = e.target.closest('.col');
+        if (!col) return;
+        const day = col.dataset.day;
+        chartDayFilter = (chartDayFilter === day) ? null : day;
+        renderSessionList();
+    });
+
+    let tip = document.getElementById('chart-tooltip');
+    if (!tip) {
+        tip = document.createElement('div');
+        tip.id = 'chart-tooltip';
+        document.body.appendChild(tip);
+    }
+
+    chart.addEventListener('mousemove', e => {
+        const col = e.target.closest('.col');
+        if (!col) { tip.style.display = 'none'; return; }
+        const cost = Number(col.dataset.cost) || 0;
+        const hint = col.dataset.day === chartDayFilter ? ' &middot; click to clear' : ' &middot; click to filter';
+        tip.innerHTML = `${col.dataset.day} &middot; <span class="value">${formatCost(cost)}</span><span class="hint">${hint}</span>`;
+        tip.style.display = 'block';
+        // Position above the cursor, clamped to the viewport.
+        const tw = tip.offsetWidth;
+        let x = e.clientX - tw / 2;
+        x = Math.max(4, Math.min(x, window.innerWidth - tw - 4));
+        tip.style.left = x + 'px';
+        tip.style.top = (e.clientY - tip.offsetHeight - 10) + 'px';
+    });
+    chart.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+}
+
 // An "automation" session is one whose first prompt is a lone "/continue-pr URL"
 // or "/continue-pr-auto URL" slash command with no extra text after the URL.
 // These are triggered by tooling
@@ -1532,13 +1675,19 @@ function isAutomationSession(row) {
     return args !== '' && !/\s/.test(args);
 }
 
-function getFilteredSessions() {
+// applyDayFilter=false is used to draw the chart itself: the chart always shows
+// the full date distribution so a selection can be switched or cleared, while
+// the table and stats respect the selected day.
+function getFilteredSessions(applyDayFilter = true) {
     let list = sessions;
     if (fullTextSessionIds) {
         list = list.filter(s => fullTextSessionIds.has(s.session_id));
     }
     if (!includeAutomations) {
         list = list.filter(s => !isAutomationSession(s));
+    }
+    if (applyDayFilter && chartDayFilter) {
+        list = list.filter(s => parseDay(s.started) === chartDayFilter);
     }
     return list;
 }
@@ -1589,6 +1738,10 @@ function renderSessionList() {
     // Totals reflect the full filtered set; only the top DISPLAY_LIMIT rows are rendered.
     const display = filtered.slice(0, DISPLAY_LIMIT);
     updateStats(filtered, display.length);
+    // The chart shows the full distribution (ignoring the selected day) and
+    // highlights the current selection.
+    renderCostChart(getFilteredSessions(false));
+    setupChartTooltip();
 
     if (filtered.length === 0) {
         tbody.innerHTML = `<tr><td colspan="15" class="empty-state">No sessions found</td></tr>`;
