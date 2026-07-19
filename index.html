@@ -743,23 +743,55 @@ let CH_PASSWORD = '';
 
 const CREDS_SUPPORTED = 'credentials' in navigator && 'PasswordCredential' in window;
 
+// The credential manager reliably round-trips only the id (user) and password.
+// Its `name` field (which we'd use for the URL) is not returned by
+// credentials.get() in most browsers, so the hostname is remembered separately
+// in localStorage, which we fully control. Neither value is secret.
+const LS_URL = 'ch_url';
+const LS_USER = 'ch_user';
+
+function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function lsSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* blocked/full — ignore */ }
+}
+
+// Load the remembered URL and user from localStorage (no user prompt).
+function loadSavedSettings() {
+    const url = lsGet(LS_URL);
+    const user = lsGet(LS_USER);
+    if (url) CH_URL = url;
+    if (user) CH_USER = user;
+}
+
 // Load any credential the browser already has for this origin (no user prompt).
 async function loadSavedCredentials() {
     if (!CREDS_SUPPORTED) return false;
     try {
         const cred = await navigator.credentials.get({ password: true, mediation: 'silent' });
         if (cred && cred.password != null) {
-            if (cred.id) CH_USER = cred.id;
+            // localStorage is authoritative for user/URL; only fall back to the
+            // credential's values when nothing was remembered there.
+            if (cred.id && !lsGet(LS_USER)) CH_USER = cred.id;
             CH_PASSWORD = cred.password || '';
-            if (cred.name) CH_URL = cred.name;
+            if (cred.name && !lsGet(LS_URL)) CH_URL = cred.name;
             return true;
         }
     } catch (e) { /* unsupported / blocked — fall through to the login form */ }
     return false;
 }
 
+// Persist the current URL and user (non-secret) so the hostname is remembered
+// even when the credential manager is unavailable or drops the `name` field.
+function saveSettings() {
+    lsSet(LS_URL, CH_URL);
+    lsSet(LS_USER, CH_USER);
+}
+
 // Persist the current credentials in the browser's credential manager.
 async function saveCredentials() {
+    saveSettings();
     // PasswordCredential requires a non-empty password and a secure context.
     if (!CREDS_SUPPORTED || !CH_PASSWORD) return;
     try {
@@ -2284,6 +2316,7 @@ document.getElementById('login-form').addEventListener('submit', e => {
 });
 
 // --- Init ---
+loadSavedSettings();
 loadSavedCredentials()
     .then(() => loadSessions())
     .then(() => handleRoute());
