@@ -904,10 +904,15 @@ const CH_HEADERS = { 'Authorization': 'never' };
 // Model pricing per million tokens
 const PRICING = {
     fable:       { input: 10, output: 50, cache_read: 1.00, cache_creation: 12.50 },
+    'opus-5.5+': { input: 4, output: 20, cache_read: 0.20, cache_creation: 5.00 },
     'opus-4.5+': { input: 5, output: 25, cache_read: 0.50, cache_creation: 6.25 },
     'opus-4.0':  { input: 15, output: 75, cache_read: 1.50, cache_creation: 18.75 },
     sonnet:      { input: 3, output: 15, cache_read: 0.30, cache_creation: 3.75 },
     haiku:       { input: 1, output: 5, cache_read: 0.10, cache_creation: 1.25 },
+    // OpenAI GPT-6 family (Codex models)
+    'gpt-6-astra': { input: 10, output: 50, cache_read: 1.00, cache_creation: 12.50 },
+    'gpt-6-sol':   { input: 2, output: 10, cache_read: 0.20, cache_creation: 2.50 },
+    'gpt-6-luna':  { input: 0.10, output: 0.50, cache_read: 0.01, cache_creation: 0.125 },
 };
 
 function detectPricingTier(model) {
@@ -915,12 +920,17 @@ function detectPricingTier(model) {
     const m = model.toLowerCase();
     // Fable 5 / Mythos 5 share pricing ($10/$50 per 1M).
     if (m.includes('fable') || m.includes('mythos')) return 'fable';
+    const gpt6 = m.match(/gpt-6\W?(astra|sol|luna)/);
+    if (gpt6) return 'gpt-6-' + gpt6[1];
     if (m.includes('opus')) {
-        // opus-4-5, opus-4-6 etc. are $5/$25; opus-4-0, opus-4-1, opus-4 (no minor) are $15/$75
-        const ver = m.match(/opus-(\d+)-(\d+)/);
-        if (ver && Number(ver[1]) >= 4 && Number(ver[2]) >= 5) return 'opus-4.5+';
-        if (ver) return 'opus-4.0';
-        return 'opus-4.5+'; // default for unversioned opus
+        // opus-5-5+ is $4/$20; opus-4-5 .. opus-5 are $5/$25; opus-4-0, opus-4-1, opus-4 are $15/$75.
+        // The minor version is 1-2 digits, so a date suffix (opus-4-20250514) is not mistaken for it.
+        const ver = m.match(/opus-(\d+)(?:[-.](\d{1,2})(?!\d))?/);
+        if (!ver) return 'opus-4.5+'; // default for unversioned opus
+        const v = Number(ver[1]) * 100 + Number(ver[2] || 0);
+        if (v >= 505) return 'opus-5.5+';
+        if (v >= 405) return 'opus-4.5+';
+        return 'opus-4.0';
     }
     if (m.includes('haiku')) return 'haiku';
     return 'sonnet';
