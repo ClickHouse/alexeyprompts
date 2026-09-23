@@ -299,6 +299,29 @@ tbody td {
     font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
 }
 
+.share-box {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+.share-box button {
+    padding: 2px 8px;
+    background: #222;
+    border: 1px solid #444;
+    color: #ccc;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+}
+.share-box button:hover { background: #333; }
+.share-box button:disabled { opacity: 0.5; cursor: default; }
+.share-box #share-status { color: #888; }
+.share-box #share-status a { color: #8cf; }
+.share-box #share-status.error { color: #dc3545; }
+
 .transcript-meta .label { color: #888; }
 .transcript-meta .val { color: #ccc; }
 
@@ -782,6 +805,10 @@ mark.search-hit.current { background: #f88; color: #000; }
     <div id="transcript-view">
         <div class="transcript-header">
             <div class="transcript-meta" id="transcript-meta"></div>
+            <div class="share-box">
+                <span id="share-status"></span>
+                <button id="share-btn" title="Upload this session to pastila.nl (encrypted) and get a viewer link">Share</button>
+            </div>
         </div>
         <div class="filters-bar" id="filters-bar">
             <div class="filters-toggles">
@@ -1922,6 +1949,8 @@ async function loadTranscript(sessionId) {
     loading.classList.remove('hidden');
     errEl.classList.add('hidden');
     container.innerHTML = '';
+    transcriptData = null;
+    resetShareStatus();
 
     // Resolve continuation families: a bookmarked member id (even one merged away
     // and no longer in `sessions`) maps to its whole family, so the glued transcript
@@ -1938,6 +1967,8 @@ async function loadTranscript(sessionId) {
     data.sessionId::String AS sid,
     data.type::String AS type,
     parseDateTime64BestEffortOrNull(data.timestamp::String) AS ts,
+    data.timestamp::String AS raw_ts,
+    data.cwd::String AS cwd,
     data.uuid::String AS uuid,
     data.parentUuid::String AS parent_uuid,
     data.message.role::String AS role,
@@ -2006,6 +2037,162 @@ function renderTranscriptMeta(sessionId) {
         ${session.git_branch ? `<span><span class="label">Branch: </span><span class="val">${escapeHtml(session.git_branch)}</span></span>` : ''}
     `;
 }
+
+// --- Share to pastila.nl ---
+// Does in the browser what the `share` Claude Code skill (share.py + pastila.py)
+// does from the shell: upload the session as JSONL to pastila.nl, encrypted with
+// a random key that only travels in the link's #fragment, and return a
+// `.claude.jsonl` link that pastila renders with a copy of this viewer. The
+// content is gzipped before encryption (pastila's `.gz` suffix), and AES-GCM is
+// used, as in pastila's own web UI (the `GCM` suffix on the key).
+const PASTILA_CH_URL = 'https://uzg8q0g12h.eu-central-1.aws.clickhouse.cloud/?user=paste';
+
+function pastilaSipHash128(m) {
+    function rotl(v, offset, bits) {
+        v[offset] = (v[offset] << bits) | (v[offset] >> (64n - bits));
+    }
+    function compress(v) {
+        v[0] += v[1]; v[2] += v[3];
+        rotl(v, 1, 13n); rotl(v, 3, 16n);
+        v[1] ^= v[0]; v[3] ^= v[2];
+        rotl(v, 0, 32n);
+        v[2] += v[1]; v[0] += v[3];
+        rotl(v, 1, 17n); rotl(v, 3, 21n);
+        v[1] ^= v[2]; v[3] ^= v[0];
+        rotl(v, 2, 32n);
+    }
+    const view = new DataView(m.buffer, m.byteOffset, m.byteLength);
+    const buf = new Uint8Array(8);
+    const v = new BigUint64Array([0x736f6d6570736575n, 0x646f72616e646f6dn, 0x6c7967656e657261n, 0x7465646279746573n]);
+    let offset = 0;
+    for (; offset < m.length - 7; offset += 8) {
+        const word = view.getBigUint64(offset, true);
+        v[3] ^= word; compress(v); compress(v); v[0] ^= word;
+    }
+    buf.set(m.subarray(offset));
+    buf[7] = m.length;
+    const word = new DataView(buf.buffer).getBigUint64(0, true);
+    v[3] ^= word; compress(v); compress(v); v[0] ^= word;
+    v[2] ^= 0xFFn;
+    compress(v); compress(v); compress(v); compress(v);
+    return ('0'.repeat(32) + ((v[0] ^ v[1]) + ((v[2] ^ v[3]) << 64n)).toString(16)).slice(-32)
+        .match(/../g).reverse().join('');
+}
+
+function bytesToBase64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000)
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+}
+
+async function gzipBytes(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// Turn the loaded (flattened) transcript rows back into Claude Code transcript
+// records -- the shape pastila's session viewer parses. Only the fields the
+// viewer uses are carried, which keeps the upload small and avoids re-reading the
+// full raw JSON (toolUseResult blobs etc.) from ClickHouse.
+function transcriptToJsonl(rows) {
+    const lines = [];
+    for (const r of rows) {
+        const rec = { type: r.type };
+        if (r.sid) rec.sessionId = r.sid;
+        if (r.uuid) rec.uuid = r.uuid;
+        rec.parentUuid = r.parent_uuid || null;
+        if (r.raw_ts || r.ts) rec.timestamp = r.raw_ts || r.ts;
+        if (r.cwd) rec.cwd = r.cwd;
+        if (r.git_branch) rec.gitBranch = r.git_branch;
+        if (r.is_sidechain) rec.isSidechain = true;
+        if (r.is_meta) rec.isMeta = true;
+        if (r.subtype) rec.subtype = r.subtype;
+        if (r.summary) rec.summary = r.summary;
+        if (Number(r.duration_ms)) rec.durationMs = Number(r.duration_ms);
+        if (r.type === 'user' || r.type === 'assistant') {
+            let content = [];
+            try { content = JSON.parse(r.content || '[]'); } catch (e) {}
+            rec.message = { role: r.role || r.type, content };
+            if (r.model) rec.message.model = r.model;
+            if (r.stop_reason) rec.message.stop_reason = r.stop_reason;
+            if (r.type === 'assistant') rec.message.usage = {
+                input_tokens: Number(r.input_tokens) || 0,
+                output_tokens: Number(r.output_tokens) || 0,
+                cache_read_input_tokens: Number(r.cache_read_tokens) || 0,
+                cache_creation_input_tokens: Number(r.cache_creation_tokens) || 0,
+            };
+        }
+        const tur = {};
+        if (r.tool_result_content) tur.content = r.tool_result_content;
+        if (r.tool_result_stdout) tur.stdout = r.tool_result_stdout;
+        if (r.tool_result_stderr) tur.stderr = r.tool_result_stderr;
+        if (r.tool_result_answers) {
+            try { tur.answers = JSON.parse(r.tool_result_answers); } catch (e) {}
+        }
+        if (Object.keys(tur).length) rec.toolUseResult = tur;
+        lines.push(JSON.stringify(rec));
+    }
+    return lines.join('\n') + '\n';
+}
+
+async function uploadToPastila(text) {
+    const key = crypto.getRandomValues(new Uint8Array(16));
+    const aesKey = await crypto.subtle.importKey('raw', key, { name: 'AES-GCM', length: 128 }, false, ['encrypt']);
+    const compressed = await gzipBytes(new TextEncoder().encode(text));
+    // Pastila's convention: the IV is the first 12 bytes of the (single-use) key.
+    const encrypted = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: key.slice(0, 12) }, aesKey, compressed));
+    const content = bytesToBase64(encrypted);
+    const hash = pastilaSipHash128(new TextEncoder().encode(content));
+    const fingerprint = 'cafebabe';
+    const resp = await fetch(PASTILA_CH_URL, {
+        method: 'POST',
+        body: 'INSERT INTO data (fingerprint_hex, hash_hex, content, is_encrypted) FORMAT JSONEachRow ' + JSON.stringify({
+            fingerprint_hex: fingerprint,
+            hash_hex: hash,
+            content,
+            is_encrypted: true,
+        }),
+    });
+    if (!resp.ok) throw new Error(`pastila upload failed: HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+    return `https://pastila.nl/?${fingerprint}/${hash}.claude.jsonl.gz#${bytesToBase64(key)}GCM`;
+}
+
+function resetShareStatus() {
+    const status = document.getElementById('share-status');
+    status.className = '';
+    status.textContent = '';
+    document.getElementById('share-btn').disabled = false;
+}
+
+async function shareTranscript() {
+    const btn = document.getElementById('share-btn');
+    const status = document.getElementById('share-status');
+    if (!transcriptData || transcriptData.length === 0) return;
+    if (!confirm('Upload this session to pastila.nl?\n\nIt is encrypted, but anyone with the link can read it, ' +
+                 'including tool calls and their output (file fragments, command output).')) return;
+    const data = transcriptData;
+    btn.disabled = true;
+    status.className = '';
+    status.textContent = 'Uploading...';
+    try {
+        const url = await uploadToPastila(transcriptToJsonl(data));
+        if (data !== transcriptData) return; // navigated to another session meanwhile
+        status.innerHTML = `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">link</a>`;
+        try {
+            await navigator.clipboard.writeText(url);
+            status.insertAdjacentText('beforeend', ' (copied)');
+        } catch (e) {}
+    } catch (e) {
+        if (data !== transcriptData) return;
+        status.className = 'error';
+        status.textContent = e.message;
+    } finally {
+        if (data === transcriptData) btn.disabled = false;
+    }
+}
+
+document.getElementById('share-btn').addEventListener('click', shareTranscript);
 
 function getFilters() {
     return {
