@@ -103,15 +103,17 @@ fi
 echo "Uploading ${#FILES[@]} new/changed session file(s)..."
 
 # Read a batch of files and insert; ReplacingMergeTree deduplicates any overlap.
+# Files are read line by line (JSONL) rather than with JSONAsString, so a corrupt
+# line (e.g. a truncated write glued to the next entry) is simply skipped by
+# isValidJSON instead of desyncing the JSON parser and failing the whole batch.
 upload_batch() {
     local arr="$1"
     [ -z "$arr" ] && return 0
     arr="[${arr%,}]"
     clickhouse-local -q "
-        SELECT _path AS path, json AS data
-        FROM file({files:Array(String)}, 'JSONAsString')
-        WHERE isValidJSON(json)
-        SETTINGS input_format_allow_errors_ratio=0.1
+        SELECT _path AS path, line AS data
+        FROM file({files:Array(String)}, 'LineAsString')
+        WHERE isValidJSON(line)
         FORMAT Native
     " --param_files="$arr" \
     | client -q "INSERT INTO claude_code.raw FORMAT Native"
