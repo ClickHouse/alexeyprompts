@@ -930,25 +930,34 @@ const CH_HEADERS = { 'Authorization': 'never' };
 
 // Model pricing per million tokens
 const PRICING = {
+    'fable-5.1+': { input: 10, output: 50, cache_read: 0.25, cache_creation: 12.50 },
     fable:       { input: 10, output: 50, cache_read: 1.00, cache_creation: 12.50 },
     'opus-5.5+': { input: 4, output: 20, cache_read: 0.20, cache_creation: 5.00 },
     'opus-4.5+': { input: 5, output: 25, cache_read: 0.50, cache_creation: 6.25 },
     'opus-4.0':  { input: 15, output: 75, cache_read: 1.50, cache_creation: 18.75 },
+    'sonnet-5+': { input: 2, output: 10, cache_read: 0.20, cache_creation: 2.50 },
     sonnet:      { input: 3, output: 15, cache_read: 0.30, cache_creation: 3.75 },
     haiku:       { input: 1, output: 5, cache_read: 0.10, cache_creation: 1.25 },
     // OpenAI GPT-6 family (Codex models)
     'gpt-6-astra': { input: 10, output: 50, cache_read: 1.00, cache_creation: 12.50 },
     'gpt-6-sol':   { input: 2, output: 10, cache_read: 0.20, cache_creation: 2.50 },
     'gpt-6-luna':  { input: 0.10, output: 0.50, cache_read: 0.01, cache_creation: 0.125 },
+    'gpt-6.1-sol': { input: 2, output: 10, cache_read: 0.10, cache_creation: 2.50 },
 };
 
 function detectPricingTier(model) {
     if (!model) return 'sonnet';
     const m = model.toLowerCase();
-    // Fable 5 / Mythos 5 share pricing ($10/$50 per 1M).
+    // Fable / Mythos share pricing ($10/$50 per 1M); 5.1+ has cheaper cache reads.
+    const fable = m.match(/(?:fable|mythos)-(\d+)(?:[-.](\d{1,2})(?!\d))?/);
+    if (fable) return Number(fable[1]) * 100 + Number(fable[2] || 0) >= 501 ? 'fable-5.1+' : 'fable';
     if (m.includes('fable') || m.includes('mythos')) return 'fable';
-    const gpt6 = m.match(/gpt-6\W?(astra|sol|luna)/);
-    if (gpt6) return 'gpt-6-' + gpt6[1];
+    // gpt-6-sol, gpt-6.1-sol, gpt-6.1-sol-codex, ...; a point release without its own price falls back to GPT-6.
+    const gpt6 = m.match(/gpt-6(?:\.(\d+))?\W?(astra|sol|luna)/);
+    if (gpt6) {
+        const tier = `gpt-6.${gpt6[1]}-${gpt6[2]}`;
+        return PRICING[tier] ? tier : 'gpt-6-' + gpt6[2];
+    }
     if (m.includes('opus')) {
         // opus-5-5+ is $4/$20; opus-4-5 .. opus-5 are $5/$25; opus-4-0, opus-4-1, opus-4 are $15/$75.
         // The minor version is 1-2 digits, so a date suffix (opus-4-20250514) is not mistaken for it.
@@ -960,6 +969,9 @@ function detectPricingTier(model) {
         return 'opus-4.0';
     }
     if (m.includes('haiku')) return 'haiku';
+    // sonnet-5 and later are $2/$10; sonnet-4.x and unknown models stay at $3/$15.
+    const sonnetVer = m.match(/sonnet-(\d+)/);
+    if (sonnetVer && Number(sonnetVer[1]) >= 5) return 'sonnet-5+';
     return 'sonnet';
 }
 
