@@ -86,8 +86,20 @@ Options (environment variables):
   non-`localhost` host, which ClickHouse Cloud requires).
 - `PROJECTS=/path/to/projects` — where the `.jsonl` files live (default
   `~/.claude/projects`); point this at a directory you sync other machines into.
+- `CODEX_SESSIONS=/path/to/sessions` — where Codex rollouts live (default
+  `~/.codex/sessions`; skipped if it doesn't exist). Thread titles are read from
+  `session_index.jsonl` next to it (override with `CODEX_INDEX`).
 - `FORCE=1` — re-upload every local file, ignoring both the marker and what's
   already in ClickHouse.
+
+**Codex sessions** are uploaded by the same script. Codex writes a different
+format, so each rollout is converted into Claude Code-shaped rows on the way in
+(prompts, replies, reasoning summaries, tool calls and outputs, token usage,
+turn durations, compactions, the thread title) and shows up in the viewer
+like any other session. Subagent threads are folded into their parent session
+as sidechains. The stored `path` is rewritten to
+`~/.codex/projects/<cwd>/rollout-….jsonl` so the `project` column works without
+schema changes.
 
 Edit `index.html` around CH_URL, CH_USER, CH_PASSWORD with your database credentials.
 
