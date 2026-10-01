@@ -1,0 +1,15 @@
+{
+  "name": "alexeyprompts",
+  "description": "Tools for the Alexey Prompts Claude Code session viewer",
+  "owner": {
+    "name": "Alexey Milovidov",
+    "email": "milovidov@clickhouse.com"
+  },
+  "plugins": [
+    {
+      "name": "clickhouse-session-upload",
+      "source": "./plugin",
+      "description": "Automatically upload Claude Code sessions to ClickHouse for the Alexey Prompts viewer"
+    }
+  ]
+}

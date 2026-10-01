@@ -1,0 +1,32 @@
+{
+  "name": "clickhouse-session-upload",
+  "displayName": "ClickHouse Session Upload",
+  "version": "1.0.0",
+  "description": "Uploads new Claude Code session entries to ClickHouse after every turn and at session end",
+  "author": {
+    "name": "Alexey Milovidov",
+    "email": "milovidov@clickhouse.com"
+  },
+  "repository": "https://github.com/ClickHouse/alexeyprompts",
+  "license": "CC-BY-NC-SA-4.0",
+  "userConfig": {
+    "ch_host": {
+      "type": "string",
+      "title": "ClickHouse host",
+      "description": "Host of the ClickHouse server with the claude_code.raw table (TLS is used for any non-local host)",
+      "required": true
+    },
+    "ch_user": {
+      "type": "string",
+      "title": "ClickHouse user",
+      "description": "User name",
+      "default": "default"
+    },
+    "ch_password": {
+      "type": "string",
+      "title": "ClickHouse password",
+      "description": "Password (stored in the system credential store)",
+      "sensitive": true
+    }
+  }
+}

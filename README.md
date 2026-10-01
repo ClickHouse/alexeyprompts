@@ -101,6 +101,33 @@ as sidechains. The stored `path` is rewritten to
 `~/.codex/projects/<cwd>/rollout-….jsonl` so the `project` column works without
 schema changes.
 
+#### Uploading automatically (Claude Code plugin)
+
+The `clickhouse-session-upload` plugin in `plugin/` uploads sessions as you
+work, with no cron needed:
+
+```
+claude plugin marketplace add ClickHouse/alexeyprompts
+claude plugin install clickhouse-session-upload@alexeyprompts
+```
+
+On enable, Claude Code asks for the ClickHouse host, user and password (the
+password goes to the system credential store). Change them later in `/config`.
+If unset, the plugin uses the `CH_HOST` / `CH_USER` / `CH_PASSWORD` /
+`CH_SECURE` environment variables, like `upload_incremental.sh`.
+
+After every turn (`Stop`) and when a session ends (`SessionEnd`), the plugin
+starts a detached background upload, so Claude Code never waits on it. The
+upload checks every `.jsonl` under `~/.claude/projects` (main sessions and
+subagents), finds the files whose size changed, and sends only the lines added
+since the last upload. Sessions from before the install, sessions from a
+crashed process, and files synced in from other machines are all caught up the
+same way. The first run uploads your whole history. Progress and errors are
+logged to `~/.claude/plugins/data/clickhouse-session-upload-alexeyprompts/upload.log`.
+
+It needs `clickhouse-local` and `clickhouse-client` in `PATH`. Codex sessions
+are not uploaded by the plugin; use `upload_incremental.sh` for those.
+
 Edit `index.html` around CH_URL, CH_USER, CH_PASSWORD with your database credentials.
 
 Optional: ask claude to run classification scripts and fill the classification table.
